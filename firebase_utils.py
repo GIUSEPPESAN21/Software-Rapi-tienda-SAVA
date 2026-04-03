@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-firebase_utils.py  –  Capa de base de datos reemplazada de Firestore → Excel
+firebase_utils.py  –  Capa de base de datos: Excel local + sincronización automática a GitHub
 Todas las operaciones de lectura/escritura se realizan sobre un único archivo
-.xlsx local.  El resto de la aplicación (app.py, barcode_manager.py) permanece
-sin ninguna modificación.
+.xlsx local. Después de cada escritura, el archivo se sube automáticamente
+a GitHub para que los datos persistan aunque Streamlit Cloud reinicie la app.
 
 Estructura del archivo Excel (hojas):
   • inventory          → id | name | quantity | purchase_price | sale_price |
@@ -12,12 +12,19 @@ Estructura del archivo Excel (hojas):
   • orders             → id | title | price | status | timestamp | completed_at |
                          payment_method | customer_name | is_direct_sale | ingredients_json
   • suppliers          → id | name | contact_person | email | phone
+
+Secrets de Streamlit requeridos:
+  GITHUB_TOKEN    → Token de acceso personal de GitHub (con permiso 'repo')
+  GITHUB_REPO     → Nombre del repositorio, ej: "GIUSEPPESAN21/Software-Rapi-tienda-SAVA"
+  GITHUB_DB_PATH  → Ruta del archivo en el repo, ej: "SAVA_DB.xlsx"
 """
 
 import logging
 import json
 import uuid
 import time
+import base64
+import requests
 from datetime import datetime, timezone
 from threading import Lock
 
@@ -30,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuración del archivo Excel
 # ---------------------------------------------------------------------------
-EXCEL_PATH = "SAVA_DB.xlsx"   # Ruta al archivo Excel (en el directorio de trabajo)
+EXCEL_PATH = "SAVA_DB.xlsx"
 
 # Columnas esperadas por hoja
 SHEET_COLUMNS = {
@@ -54,6 +61,147 @@ _excel_lock = Lock()  # Semáforo para evitar escrituras concurrentes
 
 
 # ---------------------------------------------------------------------------
+# Sincronización con GitHub
+# ---------------------------------------------------------------------------
+
+def _github_headers() -> dict:
+    """Retorna los headers de autenticación para la API de GitHub."""
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+
+def _github_api_url() -> str:
+    """Construye la URL de la API de GitHub para el archivo SAVA_DB.xlsx."""
+    repo = st.secrets.get("GITHUB_REPO", "")
+    db_path = st.secrets.get("GITHUB_DB_PATH", "SAVA_DB.xlsx")
+    return f"https://api.github.com/repos/{repo}/contents/{db_path}"
+
+
+def _is_github_configured() -> bool:
+    """Verifica que los secrets de GitHub estén presentes y muestra advertencia si faltan."""
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    repo  = st.secrets.get("GITHUB_REPO", "")
+    if not token or not repo:
+        logger.warning(
+            "⚠️  GitHub sync DESACTIVADO. "
+            "Agrega GITHUB_TOKEN y GITHUB_REPO en los Secrets de Streamlit."
+        )
+        return False
+    return True
+
+
+def _github_pull() -> None:
+    """
+    Descarga SAVA_DB.xlsx desde GitHub al sistema de archivos local.
+    Se llama al arrancar la aplicación para tener siempre la versión más reciente.
+    """
+    if not _is_github_configured():
+        return
+
+    try:
+        url = _github_api_url()
+        logger.info(f"GitHub pull → {url}")
+        resp = requests.get(url, headers=_github_headers(), timeout=30)
+
+        if resp.status_code == 404:
+            logger.info("SAVA_DB.xlsx no existe en GitHub todavía. Se creará al primer guardado.")
+            return
+
+        if resp.status_code != 200:
+            msg = f"GitHub pull falló: HTTP {resp.status_code} — {resp.text[:300]}"
+            logger.error(msg)
+            st.warning(f"⚠️ {msg}")
+            return
+
+        data = resp.json()
+
+        # Archivos >1 MB: GitHub devuelve download_url en lugar de content inline
+        if data.get("encoding") == "base64" and data.get("content"):
+            file_bytes = base64.b64decode(data["content"])
+        elif data.get("download_url"):
+            dl_resp = requests.get(data["download_url"], timeout=60)
+            dl_resp.raise_for_status()
+            file_bytes = dl_resp.content
+        else:
+            logger.warning("GitHub pull: respuesta inesperada, sin contenido.")
+            return
+
+        with open(EXCEL_PATH, "wb") as f:
+            f.write(file_bytes)
+
+        logger.info(f"✅ SAVA_DB.xlsx descargado desde GitHub ({len(file_bytes)/1024:.1f} KB).")
+
+    except Exception as e:
+        logger.error(f"GitHub pull error: {e}")
+        st.warning(f"⚠️ Error al descargar la base de datos desde GitHub: {e}")
+
+
+def _github_push() -> None:
+    """
+    Sube SAVA_DB.xlsx al repositorio de GitHub después de cada escritura.
+    Muestra feedback visible al usuario (st.toast) con éxito o error.
+    """
+    if not _is_github_configured():
+        st.warning(
+            "⚠️ **GitHub Sync desactivado.** "
+            "Para que los datos no se pierdan, agrega los secrets: "
+            "`GITHUB_TOKEN`, `GITHUB_REPO` y `GITHUB_DB_PATH` en Streamlit → Settings → Secrets."
+        )
+        return
+
+    try:
+        url = _github_api_url()
+        headers = _github_headers()
+
+        # ---------- 1. Leer archivo local ----------
+        with open(EXCEL_PATH, "rb") as f:
+            raw_bytes = f.read()
+        content_b64 = base64.b64encode(raw_bytes).decode("utf-8")
+        logger.info(f"GitHub push → {url}  ({len(raw_bytes)/1024:.1f} KB)")
+
+        # ---------- 2. Obtener SHA actual del archivo en GitHub ----------
+        sha = ""
+        get_resp = requests.get(url, headers=headers, timeout=15)
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha", "")
+            logger.info(f"SHA actual en GitHub: {sha[:10]}...")
+        elif get_resp.status_code == 404:
+            logger.info("El archivo no existe aún en GitHub; se creará ahora.")
+        else:
+            logger.warning(f"No se pudo obtener SHA: HTTP {get_resp.status_code} — {get_resp.text[:200]}")
+
+        # ---------- 3. Subir el archivo ----------
+        commit_msg = (
+            f"Auto-sync SAVA_DB.xlsx "
+            f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC]"
+        )
+        payload = {"message": commit_msg, "content": content_b64}
+        if sha:
+            payload["sha"] = sha
+
+        put_resp = requests.put(url, headers=headers, json=payload, timeout=60)
+
+        if put_resp.status_code in (200, 201):
+            logger.info("✅ SAVA_DB.xlsx sincronizado con GitHub correctamente.")
+            st.toast("☁️ Datos guardados y sincronizados con GitHub", icon="✅")
+        else:
+            error_detail = put_resp.text[:500]
+            msg = f"GitHub push falló: HTTP {put_resp.status_code} — {error_detail}"
+            logger.error(msg)
+            st.warning(f"⚠️ Error de sincronización: HTTP {put_resp.status_code}\n\n{error_detail}")
+
+    except FileNotFoundError:
+        logger.error(f"No se encontró el archivo local {EXCEL_PATH} para subir a GitHub.")
+        st.warning(f"⚠️ No se encontró {EXCEL_PATH} para sincronizar.")
+    except Exception as e:
+        logger.error(f"GitHub push error inesperado: {e}")
+        st.warning(f"⚠️ Error inesperado al sincronizar con GitHub: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers internos de bajo nivel
 # ---------------------------------------------------------------------------
 
@@ -65,7 +213,6 @@ def _read_excel() -> dict[str, pd.DataFrame]:
         for sheet, cols in SHEET_COLUMNS.items():
             if sheet in xls.sheet_names:
                 df = xls.parse(sheet, dtype=str)
-                # Asegurar que existan todas las columnas esperadas
                 for col in cols:
                     if col not in df.columns:
                         df[col] = ""
@@ -74,15 +221,23 @@ def _read_excel() -> dict[str, pd.DataFrame]:
                 dfs[sheet] = pd.DataFrame(columns=cols)
         return dfs
     except FileNotFoundError:
-        # El archivo no existe todavía; devolver DataFrames vacíos
         return {sheet: pd.DataFrame(columns=cols) for sheet, cols in SHEET_COLUMNS.items()}
 
 
 def _write_excel(dfs: dict[str, pd.DataFrame]) -> None:
-    """Escribe todas las hojas de vuelta al archivo Excel."""
+    """Escribe todas las hojas al archivo Excel local."""
     with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
         for sheet, df in dfs.items():
             df.to_excel(writer, sheet_name=sheet, index=False)
+
+
+def _write_and_sync(dfs: dict[str, pd.DataFrame]) -> None:
+    """
+    Escribe el Excel localmente y luego lo sincroniza con GitHub.
+    Todos los métodos de escritura deben usar esta función en lugar de _write_excel().
+    """
+    _write_excel(dfs)
+    _github_push()
 
 
 def _new_id() -> str:
@@ -111,18 +266,16 @@ def _row_to_order(row: pd.Series) -> dict:
     order["ingredients"] = _parse_ingredients(order)
     order.pop("ingredients_json", None)
 
-    # Reconstruir timestamp_obj como datetime con timezone para ordenamiento
     ts_raw = order.get("timestamp", "")
     try:
         ts = datetime.fromisoformat(str(ts_raw))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         order["timestamp_obj"] = ts
-        order["timestamp"] = ts          # exponer objeto datetime como en Firebase
+        order["timestamp"] = ts
     except Exception:
         order["timestamp_obj"] = datetime.min.replace(tzinfo=timezone.utc)
 
-    # completed_at como datetime si existe
     ca_raw = order.get("completed_at", "")
     try:
         if ca_raw and str(ca_raw).strip() and str(ca_raw) != "nan":
@@ -135,22 +288,18 @@ def _row_to_order(row: pd.Series) -> dict:
     except Exception:
         order["completed_at"] = None
 
-    # Convertir price a float
     try:
         order["price"] = float(order.get("price", 0) or 0)
     except Exception:
         order["price"] = 0.0
 
-    # is_direct_sale como bool
     order["is_direct_sale"] = str(order.get("is_direct_sale", "")).lower() in ("true", "1", "yes")
-
     return order
 
 
 def _row_to_inventory(row: pd.Series) -> dict:
     """Convierte una fila de la hoja 'inventory' al dict que usa app.py."""
     item = row.to_dict()
-    # Conversión de tipos numéricos
     for num_col in ("quantity", "min_stock_alert"):
         try:
             v = item.get(num_col)
@@ -163,7 +312,6 @@ def _row_to_inventory(row: pd.Series) -> dict:
             item[float_col] = float(v) if v not in (None, "", "nan", "None") else 0.0
         except Exception:
             item[float_col] = 0.0
-    # Limpiar NaN strings
     for k, v in item.items():
         if str(v) in ("nan", "None", "NaT"):
             item[k] = None
@@ -171,11 +319,11 @@ def _row_to_inventory(row: pd.Series) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Decorador de reintentos (preservado sin cambios funcionales)
+# Decorador de reintentos
 # ---------------------------------------------------------------------------
 
 def firestore_retry(func):
-    """Reintenta la función hasta 3 veces (compatible con el decorador original)."""
+    """Reintenta la función hasta 3 veces con backoff exponencial."""
     def wrapper(*args, **kwargs):
         max_retries = 3
         delay = 1
@@ -192,32 +340,39 @@ def firestore_retry(func):
 
 
 # ---------------------------------------------------------------------------
-# Clase principal (interfaz idéntica a la original)
+# Clase principal (interfaz idéntica a la versión original)
 # ---------------------------------------------------------------------------
 
 class FirebaseManager:
     """
-    Reemplaza la capa de Firestore con un backend Excel local.
-    Todos los métodos públicos mantienen la misma firma que la versión original.
+    Capa de base de datos sobre Excel local con sincronización automática a GitHub.
+    Todos los métodos públicos mantienen la misma firma que la versión Firebase original.
     """
 
     def __init__(self):
         self._ensure_excel_exists()
 
     def _ensure_excel_exists(self):
-        """Crea el archivo Excel con las hojas vacías si no existe."""
+        """
+        Al arrancar: descarga SAVA_DB.xlsx desde GitHub (versión más reciente),
+        y si no existe en ningún lado, crea uno vacío.
+        """
         import os
+        # 1. Intentar descargar desde GitHub primero
+        _github_pull()
+
+        # 2. Si después del pull el archivo no existe, crearlo vacío
         if not os.path.exists(EXCEL_PATH):
             logger.info(f"Creando archivo Excel nuevo: {EXCEL_PATH}")
             dfs = {sheet: pd.DataFrame(columns=cols) for sheet, cols in SHEET_COLUMNS.items()}
-            _write_excel(dfs)
+            _write_and_sync(dfs)
         else:
-            # Verificar y agregar hojas faltantes si el archivo ya existe
+            # Verificar hojas faltantes
             try:
                 existing_sheets = pd.ExcelFile(EXCEL_PATH, engine="openpyxl").sheet_names
                 if set(SHEET_COLUMNS.keys()) - set(existing_sheets):
                     dfs = _read_excel()
-                    _write_excel(dfs)
+                    _write_excel(dfs)  # Solo local, ya tenemos la versión de GitHub
             except Exception:
                 pass
 
@@ -236,7 +391,6 @@ class FirebaseManager:
             history_type = "Stock Inicial" if is_new else "Ajuste Manual"
             details = details or ("Item created in the system." if is_new else "Item updated manually.")
 
-            # Construir fila
             row = {
                 "id": custom_id,
                 "name": data.get("name", ""),
@@ -249,7 +403,6 @@ class FirebaseManager:
                 "updated_at": data.get("updated_at", _now_str()),
             }
 
-            # Actualizar o insertar
             idx = df_inv.index[df_inv["id"] == custom_id].tolist()
             if idx:
                 for k, v in row.items():
@@ -257,7 +410,6 @@ class FirebaseManager:
             else:
                 df_inv = pd.concat([df_inv, pd.DataFrame([row])], ignore_index=True)
 
-            # Historial
             hist_row = {
                 "id": _new_id(),
                 "item_id": custom_id,
@@ -270,7 +422,7 @@ class FirebaseManager:
 
             dfs["inventory"] = df_inv
             dfs["inventory_history"] = df_hist
-            _write_excel(dfs)
+            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
             logger.info(f"Inventory item saved/updated: {custom_id}")
 
     def delete_inventory_item(self, doc_id: str):
@@ -280,7 +432,7 @@ class FirebaseManager:
                 dfs = _read_excel()
                 dfs["inventory"] = dfs["inventory"][dfs["inventory"]["id"] != doc_id]
                 dfs["inventory_history"] = dfs["inventory_history"][dfs["inventory_history"]["item_id"] != doc_id]
-                _write_excel(dfs)
+                _write_and_sync(dfs)  # ← Guarda + sube a GitHub
             logger.info(f"Inventory item {doc_id} and history deleted.")
         except Exception as e:
             logger.error(f"Error deleting inventory item {doc_id}: {e}")
@@ -310,12 +462,11 @@ class FirebaseManager:
 
     @firestore_retry
     def create_order(self, order_data: dict):
-        """Crea una nueva orden en la hoja 'orders'."""
+        """Crea una nueva orden."""
         with _excel_lock:
             dfs = _read_excel()
             df_orders = dfs["orders"]
 
-            # Enriquecer ingredientes con precios del inventario
             enriched_ingredients = []
             for ing in order_data.get("ingredients", []):
                 item_details = self.get_inventory_item_details(ing["id"])
@@ -341,18 +492,17 @@ class FirebaseManager:
                 "ingredients_json": json.dumps(enriched_ingredients, ensure_ascii=False, default=str),
             }
             dfs["orders"] = pd.concat([df_orders, pd.DataFrame([row])], ignore_index=True)
-            _write_excel(dfs)
+            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
             logger.info(f"New order created: {order_id}")
 
     @firestore_retry
     def get_order_count(self) -> int:
-        """Devuelve el número total de órdenes registradas."""
         dfs = _read_excel()
         return len(dfs["orders"])
 
     @firestore_retry
     def get_orders(self, status: str = None) -> list:
-        """Devuelve órdenes, opcionalmente filtradas por estado, ordenadas por timestamp desc."""
+        """Devuelve órdenes ordenadas por timestamp descendente."""
         dfs = _read_excel()
         df = dfs["orders"]
         if df.empty:
@@ -360,7 +510,11 @@ class FirebaseManager:
         if status:
             df = df[df["status"] == status]
         orders = [_row_to_order(row) for _, row in df.iterrows()]
-        return sorted(orders, key=lambda x: x.get("timestamp_obj", datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
+        return sorted(
+            orders,
+            key=lambda x: x.get("timestamp_obj", datetime.min.replace(tzinfo=timezone.utc)),
+            reverse=True
+        )
 
     @firestore_retry
     def get_orders_in_date_range(self, start_date: datetime, end_date: datetime) -> list:
@@ -390,18 +544,17 @@ class FirebaseManager:
 
     @firestore_retry
     def cancel_order(self, order_id: str):
-        """Elimina una orden (equivalente a cancelar)."""
+        """Cancela (elimina) una orden."""
         with _excel_lock:
             dfs = _read_excel()
             dfs["orders"] = dfs["orders"][dfs["orders"]["id"] != order_id]
-            _write_excel(dfs)
+            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
             logger.info(f"Order {order_id} cancelled.")
 
     def complete_order(self, order_id: str):
         """
-        Completa una orden: descuenta stock del inventario, registra historial
-        y actualiza el estado de la orden a 'completed'.
-        Devuelve (success: bool, message: str, low_stock_alerts: list).
+        Completa una orden: descuenta stock, registra historial,
+        y actualiza el estado. Devuelve (bool, str, list).
         """
         with _excel_lock:
             try:
@@ -414,11 +567,10 @@ class FirebaseManager:
                 if order_rows.empty:
                     return False, "El pedido no existe.", []
 
-                order_row = order_rows.iloc[0]
-                order_data = _row_to_order(order_row)
+                order_data = _row_to_order(order_rows.iloc[0])
                 ingredients = order_data.get("ingredients", [])
 
-                # Validar stock antes de modificar nada
+                # Validar stock primero
                 for ing in ingredients:
                     inv_rows = df_inv[df_inv["id"] == ing["id"]]
                     if inv_rows.empty:
@@ -427,7 +579,6 @@ class FirebaseManager:
                     if current_qty < ing.get("quantity", 0):
                         return False, f"Stock insuficiente para '{ing.get('name')}'.", []
 
-                # Aplicar cambios
                 low_stock_alerts = []
                 now_str = _now_str()
 
@@ -440,7 +591,6 @@ class FirebaseManager:
                     new_qty = current_qty - ing["quantity"]
                     df_inv.at[i, "quantity"] = new_qty
 
-                    # Historial
                     hist_row = {
                         "id": _new_id(),
                         "item_id": ing["id"],
@@ -451,17 +601,15 @@ class FirebaseManager:
                     }
                     df_hist = pd.concat([df_hist, pd.DataFrame([hist_row])], ignore_index=True)
 
-                    # Alerta de stock mínimo
                     try:
                         min_alert = int(float(df_inv.at[i, "min_stock_alert"] or 0))
                     except Exception:
                         min_alert = 0
                     if min_alert and 0 < new_qty <= min_alert:
                         low_stock_alerts.append(
-                            f"'{df_inv.at[i, 'name']}' ha alcanzado el umbral de stock mínimo ({new_qty}/{min_alert})."
+                            f"'{df_inv.at[i, 'name']}' ha alcanzado el umbral mínimo ({new_qty}/{min_alert})."
                         )
 
-                # Actualizar estado de la orden
                 ord_idx = df_orders.index[df_orders["id"] == order_id].tolist()[0]
                 df_orders.at[ord_idx, "status"] = "completed"
                 df_orders.at[ord_idx, "completed_at"] = now_str
@@ -469,7 +617,7 @@ class FirebaseManager:
                 dfs["inventory"] = df_inv
                 dfs["inventory_history"] = df_hist
                 dfs["orders"] = df_orders
-                _write_excel(dfs)
+                _write_and_sync(dfs)  # ← Guarda + sube a GitHub
 
                 return True, f"Pedido '{order_data.get('title')}' completado.", low_stock_alerts
 
@@ -479,9 +627,8 @@ class FirebaseManager:
 
     def process_direct_sale(self, items_sold: list, sale_id: str, payment_data: dict = None):
         """
-        Procesa una venta directa: descuenta stock, registra historial y
-        crea un registro en 'orders'.
-        Devuelve (success: bool, message: str, low_stock_alerts: list).
+        Procesa una venta directa: descuenta stock, historial y crea orden.
+        Devuelve (bool, str, list).
         """
         with _excel_lock:
             try:
@@ -496,7 +643,6 @@ class FirebaseManager:
                 total_sale_amount = 0.0
                 enriched_ingredients = []
 
-                # Validar stock y calcular total
                 for sold_item in items_sold:
                     inv_rows = df_inv[df_inv["id"] == sold_item["id"]]
                     if inv_rows.empty:
@@ -516,7 +662,6 @@ class FirebaseManager:
                         "purchase_price": item_data.get("purchase_price", 0.0),
                     })
 
-                # Aplicar ajustes de stock e historial
                 low_stock_alerts = []
                 now_str = _now_str()
 
@@ -545,10 +690,9 @@ class FirebaseManager:
                         min_alert = 0
                     if min_alert and 0 < new_qty <= min_alert:
                         low_stock_alerts.append(
-                            f"'{df_inv.at[i, 'name']}' ha alcanzado el umbral de stock mínimo ({new_qty}/{min_alert})."
+                            f"'{df_inv.at[i, 'name']}' ha alcanzado el umbral mínimo ({new_qty}/{min_alert})."
                         )
 
-                # Crear registro de orden para el reporte diario
                 title_suffix = sale_id.split("-")[-1] if "-" in sale_id else sale_id
                 order_row = {
                     "id": sale_id,
@@ -567,7 +711,7 @@ class FirebaseManager:
                 dfs["inventory"] = df_inv
                 dfs["inventory_history"] = df_hist
                 dfs["orders"] = df_orders
-                _write_excel(dfs)
+                _write_and_sync(dfs)  # ← Guarda + sube a GitHub
 
                 return True, f"Venta '{sale_id}' procesada y stock actualizado.", low_stock_alerts
 
@@ -592,7 +736,7 @@ class FirebaseManager:
                 "phone": supplier_data.get("phone", ""),
             }
             dfs["suppliers"] = pd.concat([dfs["suppliers"], pd.DataFrame([row])], ignore_index=True)
-            _write_excel(dfs)
+            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
             logger.info("New supplier added.")
 
     @firestore_retry
