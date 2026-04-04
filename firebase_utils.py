@@ -1,22 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 firebase_utils.py  –  Capa de base de datos: Excel local + sincronización automática a GitHub
-Todas las operaciones de lectura/escritura se realizan sobre un único archivo
-.xlsx local. Después de cada escritura, el archivo se sube automáticamente
-a GitHub para que los datos persistan aunque Streamlit Cloud reinicie la app.
-
-Estructura del archivo Excel (hojas):
-  • inventory          → id | name | quantity | purchase_price | sale_price |
-                         min_stock_alert | supplier_id | supplier_name | updated_at
-  • inventory_history  → id | item_id | timestamp | type | quantity_change | details
-  • orders             → id | title | price | status | timestamp | completed_at |
-                         payment_method | customer_name | is_direct_sale | ingredients_json
-  • suppliers          → id | name | contact_person | email | phone
-
-Secrets de Streamlit requeridos:
-  GITHUB_TOKEN    → Token de acceso personal de GitHub (con permiso 'repo')
-  GITHUB_REPO     → Nombre del repositorio, ej: "GIUSEPPESAN21/Software-Rapi-tienda-SAVA"
-  GITHUB_DB_PATH  → Ruta del archivo en el repo, ej: "SAVA_DB.xlsx"
+Optimizada con Caché en Memoria RAM y Sincronización Asíncrona (Background Threading)
 """
 
 import logging
@@ -25,14 +10,19 @@ import uuid
 import time
 import base64
 import requests
+import threading
 from datetime import datetime, timezone
 from threading import Lock
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 import pandas as pd
 import streamlit as st
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- OPTIMIZACIÓN 2: Caché en RAM para evitar lecturas constantes de disco ---
+_cached_dfs = None
 
 # ---------------------------------------------------------------------------
 # Configuración del archivo Excel
@@ -202,11 +192,15 @@ def _github_push() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helpers internos de bajo nivel
+# Helpers internos de bajo nivel (Optimizados en RAM)
 # ---------------------------------------------------------------------------
 
 def _read_excel() -> dict[str, pd.DataFrame]:
-    """Lee todas las hojas del Excel y devuelve un dict sheet→DataFrame."""
+    """Lee todas las hojas del Excel. Devuelve el caché en memoria si existe."""
+    global _cached_dfs
+    if _cached_dfs is not None:
+        return {k: v.copy() for k, v in _cached_dfs.items()}
+
     try:
         xls = pd.ExcelFile(EXCEL_PATH, engine="openpyxl")
         dfs = {}
@@ -219,13 +213,20 @@ def _read_excel() -> dict[str, pd.DataFrame]:
                 dfs[sheet] = df[cols]
             else:
                 dfs[sheet] = pd.DataFrame(columns=cols)
+        
+        _cached_dfs = {k: v.copy() for k, v in dfs.items()}
         return dfs
     except FileNotFoundError:
-        return {sheet: pd.DataFrame(columns=cols) for sheet, cols in SHEET_COLUMNS.items()}
+        dfs = {sheet: pd.DataFrame(columns=cols) for sheet, cols in SHEET_COLUMNS.items()}
+        _cached_dfs = {k: v.copy() for k, v in dfs.items()}
+        return dfs
 
 
 def _write_excel(dfs: dict[str, pd.DataFrame]) -> None:
-    """Escribe todas las hojas al archivo Excel local."""
+    """Escribe todas las hojas al archivo Excel local y actualiza el caché."""
+    global _cached_dfs
+    _cached_dfs = {k: v.copy() for k, v in dfs.items()}
+
     with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
         for sheet, df in dfs.items():
             df.to_excel(writer, sheet_name=sheet, index=False)
@@ -233,15 +234,18 @@ def _write_excel(dfs: dict[str, pd.DataFrame]) -> None:
 
 def _write_and_sync(dfs: dict[str, pd.DataFrame]) -> None:
     """
-    Escribe el Excel localmente y luego lo sincroniza con GitHub.
-    Todos los métodos de escritura deben usar esta función en lugar de _write_excel().
+    Escribe el Excel localmente y luego lo sincroniza con GitHub de forma asíncrona.
     """
     _write_excel(dfs)
-    _github_push()
+    
+    # --- OPTIMIZACIÓN 1: Hilo en segundo plano para evitar congelar la UI ---
+    t = threading.Thread(target=_github_push, daemon=True)
+    add_script_run_ctx(t) # Permite que st.toast se muestre desde el hilo
+    t.start()
 
 
 def _new_id() -> str:
-    """Genera un ID único corto (20 chars), similar al auto-ID de Firestore."""
+    """Genera un ID único corto (20 chars)."""
     return uuid.uuid4().hex[:20]
 
 
@@ -340,13 +344,12 @@ def firestore_retry(func):
 
 
 # ---------------------------------------------------------------------------
-# Clase principal (interfaz idéntica a la versión original)
+# Clase principal Manager
 # ---------------------------------------------------------------------------
 
 class FirebaseManager:
     """
     Capa de base de datos sobre Excel local con sincronización automática a GitHub.
-    Todos los métodos públicos mantienen la misma firma que la versión Firebase original.
     """
 
     def __init__(self):
@@ -358,21 +361,18 @@ class FirebaseManager:
         y si no existe en ningún lado, crea uno vacío.
         """
         import os
-        # 1. Intentar descargar desde GitHub primero
         _github_pull()
 
-        # 2. Si después del pull el archivo no existe, crearlo vacío
         if not os.path.exists(EXCEL_PATH):
             logger.info(f"Creando archivo Excel nuevo: {EXCEL_PATH}")
             dfs = {sheet: pd.DataFrame(columns=cols) for sheet, cols in SHEET_COLUMNS.items()}
             _write_and_sync(dfs)
         else:
-            # Verificar hojas faltantes
             try:
                 existing_sheets = pd.ExcelFile(EXCEL_PATH, engine="openpyxl").sheet_names
                 if set(SHEET_COLUMNS.keys()) - set(existing_sheets):
                     dfs = _read_excel()
-                    _write_excel(dfs)  # Solo local, ya tenemos la versión de GitHub
+                    _write_excel(dfs)
             except Exception:
                 pass
 
@@ -422,7 +422,7 @@ class FirebaseManager:
 
             dfs["inventory"] = df_inv
             dfs["inventory_history"] = df_hist
-            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+            _write_and_sync(dfs)  # ← Guarda + sube a GitHub (en hilo secundario)
             logger.info(f"Inventory item saved/updated: {custom_id}")
 
     def delete_inventory_item(self, doc_id: str):
@@ -432,7 +432,7 @@ class FirebaseManager:
                 dfs = _read_excel()
                 dfs["inventory"] = dfs["inventory"][dfs["inventory"]["id"] != doc_id]
                 dfs["inventory_history"] = dfs["inventory_history"][dfs["inventory_history"]["item_id"] != doc_id]
-                _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+                _write_and_sync(dfs)
             logger.info(f"Inventory item {doc_id} and history deleted.")
         except Exception as e:
             logger.error(f"Error deleting inventory item {doc_id}: {e}")
@@ -492,7 +492,7 @@ class FirebaseManager:
                 "ingredients_json": json.dumps(enriched_ingredients, ensure_ascii=False, default=str),
             }
             dfs["orders"] = pd.concat([df_orders, pd.DataFrame([row])], ignore_index=True)
-            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+            _write_and_sync(dfs)
             logger.info(f"New order created: {order_id}")
 
     @firestore_retry
@@ -548,7 +548,7 @@ class FirebaseManager:
         with _excel_lock:
             dfs = _read_excel()
             dfs["orders"] = dfs["orders"][dfs["orders"]["id"] != order_id]
-            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+            _write_and_sync(dfs)
             logger.info(f"Order {order_id} cancelled.")
 
     def complete_order(self, order_id: str):
@@ -617,7 +617,7 @@ class FirebaseManager:
                 dfs["inventory"] = df_inv
                 dfs["inventory_history"] = df_hist
                 dfs["orders"] = df_orders
-                _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+                _write_and_sync(dfs)
 
                 return True, f"Pedido '{order_data.get('title')}' completado.", low_stock_alerts
 
@@ -711,7 +711,7 @@ class FirebaseManager:
                 dfs["inventory"] = df_inv
                 dfs["inventory_history"] = df_hist
                 dfs["orders"] = df_orders
-                _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+                _write_and_sync(dfs)
 
                 return True, f"Venta '{sale_id}' procesada y stock actualizado.", low_stock_alerts
 
@@ -736,7 +736,7 @@ class FirebaseManager:
                 "phone": supplier_data.get("phone", ""),
             }
             dfs["suppliers"] = pd.concat([dfs["suppliers"], pd.DataFrame([row])], ignore_index=True)
-            _write_and_sync(dfs)  # ← Guarda + sube a GitHub
+            _write_and_sync(dfs)
             logger.info("New supplier added.")
 
     @firestore_retry
