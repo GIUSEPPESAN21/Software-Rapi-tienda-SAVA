@@ -1164,7 +1164,7 @@ elif st.session_state.page == "📊 Analítica":
 
 
 elif st.session_state.page == "📈 Reporte Diario":
-    # --- Zona horaria Colombia (UTC-5) ---
+    # ── Zona horaria Colombia (UTC-5) ──────────────────────────────────────
     _COL_TZ = timezone(timedelta(hours=-5))
     _now_col = datetime.now(_COL_TZ)
     _MESES_ES = {
@@ -1173,33 +1173,532 @@ elif st.session_state.page == "📈 Reporte Diario":
         9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
     }
     _fecha_legible = f"{_now_col.day} de {_MESES_ES[_now_col.month]} de {_now_col.year}"
-    _hora_legible = _now_col.strftime("%I:%M %p").lstrip("0")
+    _hora_legible  = _now_col.strftime("%I:%M %p").lstrip("0")
+    _mes_actual    = f"{_MESES_ES[_now_col.month].capitalize()} {_now_col.year}"
 
     st.subheader("📊 Reporte Diario de Ventas")
-    st.markdown(
-        f"📅 **Fecha:** {_fecha_legible} — 🕐 **Hora:** {_hora_legible}",
-    )
+    st.markdown(f"📅 **Fecha:** {_fecha_legible} — 🕐 **Hora:** {_hora_legible}")
     st.markdown("---")
 
-    try:
-        # --- Calcular rangos de fecha ---
-        today_utc = datetime.now(timezone.utc).date()
-        start_of_day = datetime(today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc)
-        end_of_day = start_of_day + timedelta(days=1)
+    # ── Helper: genera Excel profesional con estilos ───────────────────────
+    def _build_professional_excel(
+        fecha_legible, hora_legible, mes_actual,
+        # Datos del día
+        completed_today, items_sold_dict, df_items_today,
+        total_rev, total_cash, total_credit, n_trans, avg_tick,
+        total_cogs_day, gross_profit_day,
+        # Datos del mes
+        completed_month, month_revenue, month_cogs, month_profit,
+        month_margin, month_num_sales, month_items_dict,
+    ):
+        '''Crea y devuelve un BytesIO con el Excel completo y estilizado.'''
+        from openpyxl import Workbook
+        from openpyxl.styles import (
+            PatternFill, Font, Alignment, Border, Side, GradientFill
+        )
+        from openpyxl.utils import get_column_letter
 
-        start_of_month = datetime(today_utc.year, today_utc.month, 1, tzinfo=timezone.utc)
+        wb = Workbook()
+
+        # ── Paleta de colores corporativa ──────────────────────────────────
+        COLOR_VERDE_OSC  = "1B5E20"   # verde oscuro encabezados
+        COLOR_VERDE_MED  = "2E7D32"   # verde medio subencabezados
+        COLOR_VERDE_CLAR = "C8E6C9"   # verde claro filas alternadas
+        COLOR_NARANJA    = "E65100"   # naranja alertas
+        COLOR_AZUL       = "1565C0"   # azul métricas
+        COLOR_GRIS       = "ECEFF1"   # gris fondo secundario
+        COLOR_BLANCO     = "FFFFFF"
+        COLOR_NEGRO      = "212121"
+        COLOR_AMARILLO   = "F9A825"   # fiado/crédito
+
+        def _fill(hex_color):
+            return PatternFill("solid", fgColor=hex_color)
+
+        def _font(bold=False, color=COLOR_NEGRO, size=11, italic=False):
+            return Font(bold=bold, color=color, size=size, italic=italic,
+                        name="Calibri")
+
+        def _border():
+            thin = Side(style="thin", color="B0BEC5")
+            return Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        def _align(h="center", v="center", wrap=False):
+            return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+        def _header_row(ws, row, values, fill_color, font_color="FFFFFF",
+                        font_size=11, bold=True, height=22):
+            '''Escribe y estiliza una fila de encabezado.'''
+            ws.row_dimensions[row].height = height
+            for col, val in enumerate(values, 1):
+                c = ws.cell(row=row, column=col, value=val)
+                c.fill      = _fill(fill_color)
+                c.font      = _font(bold=bold, color=font_color, size=font_size)
+                c.alignment = _align("center")
+                c.border    = _border()
+
+        def _data_row(ws, row, values, alt=False, fmt_map=None, height=18):
+            '''Escribe y estiliza una fila de datos (color alternado).'''
+            ws.row_dimensions[row].height = height
+            bg = COLOR_VERDE_CLAR if alt else COLOR_BLANCO
+            for col, val in enumerate(values, 1):
+                c = ws.cell(row=row, column=col, value=val)
+                c.fill      = _fill(bg)
+                c.font      = _font(size=10)
+                c.alignment = _align("center")
+                c.border    = _border()
+                if fmt_map and col in fmt_map:
+                    c.number_format = fmt_map[col]
+
+        def _auto_col_width(ws, extra=4):
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    try:
+                        if cell.value:
+                            max_len = max(max_len, len(str(cell.value)))
+                    except Exception:
+                        pass
+                ws.column_dimensions[col_letter].width = min(max_len + extra, 45)
+
+        def _merge_title(ws, row, text, end_col, fill_color, font_size=12,
+                         font_color="FFFFFF", height=26):
+            ws.merge_cells(start_row=row, start_column=1,
+                           end_row=row, end_column=end_col)
+            c = ws.cell(row=row, column=1, value=text)
+            c.fill      = _fill(fill_color)
+            c.font      = _font(bold=True, color=font_color, size=font_size)
+            c.alignment = _align("center", wrap=True)
+            c.border    = _border()
+            ws.row_dimensions[row].height = height
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 1 — PORTADA
+        # ══════════════════════════════════════════════════════════════════
+        ws0 = wb.active
+        ws0.title = "📋 Portada"
+        ws0.sheet_view.showGridLines = False
+
+        # Título principal
+        ws0.merge_cells("A1:F1")
+        c = ws0["A1"]
+        c.value     = "RAPI TIENDA ACUARELA"
+        c.fill      = _fill(COLOR_VERDE_OSC)
+        c.font      = _font(bold=True, color=COLOR_BLANCO, size=20)
+        c.alignment = _align("center")
+        ws0.row_dimensions[1].height = 40
+
+        ws0.merge_cells("A2:F2")
+        c = ws0["A2"]
+        c.value     = "Sistema SAVA — Reporte Completo de Gestión"
+        c.fill      = _fill(COLOR_VERDE_MED)
+        c.font      = _font(bold=True, color=COLOR_BLANCO, size=13)
+        c.alignment = _align("center")
+        ws0.row_dimensions[2].height = 26
+
+        ws0.row_dimensions[3].height = 10
+
+        cover_data = [
+            ("📅 Fecha del Reporte", fecha_legible),
+            ("🕐 Hora de Generación", hora_legible),
+            ("📆 Mes en Análisis", mes_actual),
+            ("🧾 Ventas Completadas Hoy", n_trans),
+            ("💰 Ingresos del Día", f"${total_rev:,.2f}"),
+            ("📦 Ingresos del Mes", f"${month_revenue:,.2f}"),
+            ("📈 Beneficio Bruto del Mes", f"${month_profit:,.2f}"),
+            ("📊 Margen del Mes", f"{month_margin:.1f}%"),
+            ("🏪 Generado por", "SAVA Software for Engineering"),
+        ]
+        for i, (label, val) in enumerate(cover_data, 4):
+            ws0.row_dimensions[i].height = 22
+            cL = ws0.cell(row=i, column=1, value=label)
+            cL.fill      = _fill(COLOR_GRIS)
+            cL.font      = _font(bold=True, size=11)
+            cL.alignment = _align("left")
+            cL.border    = _border()
+
+            cV = ws0.cell(row=i, column=2, value=val)
+            cV.fill      = _fill(COLOR_BLANCO)
+            cV.font      = _font(size=11)
+            cV.alignment = _align("left")
+            cV.border    = _border()
+
+        ws0.column_dimensions["A"].width = 32
+        ws0.column_dimensions["B"].width = 30
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 2 — RESUMEN DEL DÍA (KPIs)
+        # ══════════════════════════════════════════════════════════════════
+        ws1 = wb.create_sheet("📊 Resumen Diario")
+        ws1.sheet_view.showGridLines = False
+
+        _merge_title(ws1, 1, f"RESUMEN DEL DÍA — {fecha_legible}", 4,
+                     COLOR_VERDE_OSC, 14)
+
+        _header_row(ws1, 2, ["Indicador", "Valor", "Detalle", "Estado"],
+                    COLOR_VERDE_MED)
+
+        kpi_rows = [
+            ("💰 Ingresos Totales",       total_rev,
+             "Suma de todas las ventas completadas hoy",
+             "✅ Activo"),
+            ("💵 Ingresos en Efectivo",   total_cash,
+             "Ventas pagadas en efectivo",
+             "✅ Cobrado"),
+            ("📝 Ventas a Crédito/Fiado", total_credit,
+             "Ventas pendientes de cobro",
+             "⚠️ Por cobrar" if total_credit > 0 else "✅ Sin fiado"),
+            ("📦 Costo de Mercancía",     total_cogs_day,
+             "Costo de compra de productos vendidos",
+             "📊 Calculado"),
+            ("📈 Beneficio Bruto",        gross_profit_day,
+             "Ingresos - Costo de mercancía",
+             "✅ Positivo" if gross_profit_day >= 0 else "⚠️ Negativo"),
+            ("🧾 N° de Transacciones",    n_trans,
+             "Total de ventas completadas hoy",
+             "📊 Calculado"),
+            ("🎯 Ticket Promedio",        avg_tick,
+             "Ingreso promedio por venta",
+             "📊 Calculado"),
+        ]
+        margin_day = (gross_profit_day / total_rev * 100) if total_rev > 0 else 0
+        kpi_rows.append(
+            ("📊 Margen de Beneficio Día", f"{margin_day:.1f}%",
+             "Beneficio sobre ingresos del día",
+             "✅ Saludable" if margin_day >= 20 else "⚠️ Bajo"),
+        )
+
+        for i, (ind, val, det, est) in enumerate(kpi_rows, 3):
+            alt = (i % 2 == 0)
+            bg = COLOR_VERDE_CLAR if alt else COLOR_BLANCO
+            ws1.row_dimensions[i].height = 20
+
+            for col, v in enumerate([ind, val, det, est], 1):
+                c = ws1.cell(row=i, column=col, value=v)
+                c.fill      = _fill(bg)
+                c.font      = _font(size=10,
+                                    bold=(col == 1),
+                                    color="1B5E20" if col == 1 else COLOR_NEGRO)
+                c.alignment = _align("left" if col in (1, 3) else "center")
+                c.border    = _border()
+                if col == 2 and isinstance(v, (int, float)) and not isinstance(v, str):
+                    c.number_format = '$#,##0.00'
+
+        _auto_col_width(ws1, extra=5)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 3 — VENTAS DETALLADAS DEL DÍA
+        # ══════════════════════════════════════════════════════════════════
+        ws2 = wb.create_sheet("🧾 Ventas Detalladas")
+        ws2.sheet_view.showGridLines = False
+
+        _merge_title(ws2, 1, f"VENTAS DETALLADAS — {fecha_legible}", 8,
+                     COLOR_VERDE_OSC, 14)
+
+        headers_v = ["#", "Nombre de Venta", "Hora", "Cliente",
+                     "Método de Pago", "N° Productos", "Total ($)", "Estado"]
+        _header_row(ws2, 2, headers_v, COLOR_VERDE_MED)
+
+        fmt_v = {7: '$#,##0.00'}
+        for i, order in enumerate(completed_today, 1):
+            ca = order.get('completed_at')
+            hora_v = (ca.astimezone(_COL_TZ).strftime("%I:%M %p").lstrip("0")
+                      if ca and isinstance(ca, datetime) else "N/A")
+            metodo = ("💳 Fiado/Crédito"
+                      if order.get('payment_method') == 'fiado'
+                      else "💵 Efectivo")
+            n_prod  = sum(it.get('quantity', 0)
+                         for it in order.get('ingredients', []))
+            vals = [
+                i,
+                order.get('title', 'Sin título'),
+                hora_v,
+                order.get('customer_name', 'Cliente General'),
+                metodo,
+                n_prod,
+                order.get('price', 0),
+                "✅ Completada",
+            ]
+            _data_row(ws2, i + 2, vals, alt=(i % 2 == 0), fmt_map=fmt_v)
+
+        _auto_col_width(ws2, extra=4)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 4 — PRODUCTOS VENDIDOS HOY
+        # ══════════════════════════════════════════════════════════════════
+        ws3 = wb.create_sheet("📦 Productos Hoy")
+        ws3.sheet_view.showGridLines = False
+
+        _merge_title(ws3, 1, f"PRODUCTOS VENDIDOS HOY — {fecha_legible}", 7,
+                     COLOR_VERDE_OSC, 14)
+
+        headers_p = ["Producto", "Unidades\nVendidas", "Precio\nUnitario ($)",
+                     "Costo\nUnitario ($)", "Subtotal\nVentas ($)",
+                     "Costo\nTotal ($)", "Margen\nBruto ($)"]
+        _header_row(ws3, 2, headers_p, COLOR_VERDE_MED, height=30)
+
+        fmt_p = {3: '$#,##0.00', 4: '$#,##0.00', 5: '$#,##0.00',
+                 6: '$#,##0.00', 7: '$#,##0.00'}
+
+        prod_rows = []
+        for _order in completed_today:
+            for _ing in _order.get('ingredients', []):
+                pname = _ing.get('name', 'N/A')
+                qty   = _ing.get('quantity', 0)
+                sp    = _ing.get('sale_price', 0.0)
+                pp    = _ing.get('purchase_price', 0.0)
+                if pname not in {r[0] for r in prod_rows}:
+                    prod_rows.append([pname, qty, sp, pp,
+                                      qty * sp, qty * pp,
+                                      qty * (sp - pp)])
+                else:
+                    for r in prod_rows:
+                        if r[0] == pname:
+                            r[1] += qty
+                            r[4] += qty * sp
+                            r[5] += qty * pp
+                            r[6] += qty * (sp - pp)
+                            break
+
+        prod_rows.sort(key=lambda r: r[4], reverse=True)
+
+        i = 2
+        for i_idx, row in enumerate(prod_rows, 3):
+            i = i_idx
+            _data_row(ws3, i, row, alt=(i % 2 == 0), fmt_map=fmt_p)
+
+        # Fila de TOTALES
+        tot_row = i + 1 if prod_rows else 3
+        ws3.row_dimensions[tot_row].height = 22
+        tot_vals = [
+            "TOTALES",
+            sum(r[1] for r in prod_rows),
+            "",
+            "",
+            sum(r[4] for r in prod_rows),
+            sum(r[5] for r in prod_rows),
+            sum(r[6] for r in prod_rows),
+        ]
+        for col, v in enumerate(tot_vals, 1):
+            c = ws3.cell(row=tot_row, column=col, value=v)
+            c.fill      = _fill(COLOR_VERDE_OSC)
+            c.font      = _font(bold=True, color=COLOR_BLANCO, size=11)
+            c.alignment = _align("center")
+            c.border    = _border()
+            if col in fmt_p and isinstance(v, (int, float)) and not isinstance(v, str):
+                c.number_format = '$#,##0.00'
+
+        _auto_col_width(ws3, extra=4)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 5 — CLIENTES CON FIADO
+        # ══════════════════════════════════════════════════════════════════
+        ws4 = wb.create_sheet("📝 Clientes Fiado")
+        ws4.sheet_view.showGridLines = False
+
+        _merge_title(ws4, 1, f"CLIENTES CON CRÉDITO/FIADO — {fecha_legible}",
+                     5, COLOR_NARANJA, 13)
+
+        headers_f = ["Cliente", "Venta", "Hora", "Total ($)", "Estado"]
+        _header_row(ws4, 2, headers_f, COLOR_NARANJA)
+
+        credit_orders = [o for o in completed_today
+                         if o.get('payment_method') == 'fiado']
+        fmt_f = {4: '$#,##0.00'}
+
+        if credit_orders:
+            for i, order in enumerate(credit_orders, 3):
+                ca = order.get('completed_at')
+                hora_f = (ca.astimezone(_COL_TZ).strftime("%I:%M %p").lstrip("0")
+                          if ca and isinstance(ca, datetime) else "N/A")
+                vals_f = [
+                    order.get('customer_name', 'Sin nombre'),
+                    order.get('title', 'Sin título'),
+                    hora_f,
+                    order.get('price', 0),
+                    "⚠️ Pendiente de cobro",
+                ]
+                _data_row(ws4, i, vals_f, alt=(i % 2 == 0), fmt_map=fmt_f)
+
+            # Total fiado
+            tf_row = len(credit_orders) + 3
+            ws4.row_dimensions[tf_row].height = 22
+            for col in range(1, 6):
+                c = ws4.cell(row=tf_row, column=col)
+                c.fill   = _fill(COLOR_NARANJA)
+                c.font   = _font(bold=True, color=COLOR_BLANCO, size=11)
+                c.border = _border()
+                c.alignment = _align("center")
+            ws4.cell(row=tf_row, column=1).value = "TOTAL FIADO"
+            tc = ws4.cell(row=tf_row, column=4,
+                          value=sum(o.get('price', 0) for o in credit_orders))
+            tc.number_format = '$#,##0.00'
+        else:
+            ws4.merge_cells("A3:E3")
+            c = ws4["A3"]
+            c.value     = "✅ No hay ventas a crédito/fiado en esta fecha"
+            c.fill      = _fill(COLOR_VERDE_CLAR)
+            c.font      = _font(bold=True, color="1B5E20", size=11)
+            c.alignment = _align("center")
+
+        _auto_col_width(ws4, extra=4)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 6 — RESUMEN MENSUAL (KPIs)
+        # ══════════════════════════════════════════════════════════════════
+        ws5 = wb.create_sheet("📅 Resumen Mensual")
+        ws5.sheet_view.showGridLines = False
+
+        _merge_title(ws5, 1, f"RESUMEN MENSUAL — {mes_actual}", 4,
+                     COLOR_AZUL, 14, font_color=COLOR_BLANCO)
+
+        _header_row(ws5, 2, ["Indicador", "Valor", "Detalle", "Estado"],
+                    "1565C0")
+
+        month_avg = month_revenue / max(_now_col.day, 1)
+        day_pct   = (total_rev / month_revenue * 100) if month_revenue > 0 else 0
+
+        kpi_month = [
+            ("💰 Ingresos Totales del Mes",  month_revenue,
+             f"Acumulado al {fecha_legible}", "✅"),
+            ("📦 Costo Total de Mercancía",  month_cogs,
+             "Costo de compra acumulado", "📊"),
+            ("📈 Beneficio Bruto del Mes",   month_profit,
+             "Ingresos - Costos",
+             "✅ Positivo" if month_profit >= 0 else "⚠️ Negativo"),
+            ("📊 Margen de Beneficio",
+             f"{month_margin:.2f}%",
+             "Rentabilidad del mes",
+             "✅ Bueno" if month_margin >= 20 else "⚠️ Bajo"),
+            ("🧾 Total de Ventas del Mes",   month_num_sales,
+             "Ventas completadas en el mes", "📊"),
+            ("📆 Promedio Diario de Ventas", month_avg,
+             "Ingreso promedio por día trabajado", "📊"),
+            ("⚡ Participación del Día Hoy",
+             f"{day_pct:.1f}%",
+             f"Hoy aportó {day_pct:.1f}% del ingreso mensual", "📊"),
+        ]
+        for i, (ind, val, det, est) in enumerate(kpi_month, 3):
+            alt = (i % 2 == 0)
+            bg  = "BBDEFB" if alt else COLOR_BLANCO
+            ws5.row_dimensions[i].height = 20
+            for col, v in enumerate([ind, val, det, est], 1):
+                c = ws5.cell(row=i, column=col, value=v)
+                c.fill      = _fill(bg)
+                c.font      = _font(size=10, bold=(col == 1),
+                                    color="1565C0" if col == 1 else COLOR_NEGRO)
+                c.alignment = _align("left" if col in (1, 3) else "center")
+                c.border    = _border()
+                if col == 2 and isinstance(v, (int, float)) and not isinstance(v, str):
+                    c.number_format = '$#,##0.00'
+
+        _auto_col_width(ws5, extra=5)
+
+        # ══════════════════════════════════════════════════════════════════
+        #  HOJA 7 — PRODUCTOS VENDIDOS DEL MES
+        # ══════════════════════════════════════════════════════════════════
+        ws6 = wb.create_sheet("🏆 Productos del Mes")
+        ws6.sheet_view.showGridLines = False
+
+        _merge_title(ws6, 1, f"ANÁLISIS DE PRODUCTOS — {mes_actual}", 8,
+                     COLOR_AZUL, 14, font_color=COLOR_BLANCO)
+
+        headers_m = ["Ranking", "Producto",
+                     "Unidades\nVendidas", "Precio\nUnitario ($)",
+                     "Ingresos\nTotal ($)", "Costo\nTotal ($)",
+                     "Margen\nBruto ($)", "Margen\n(%)"]
+        _header_row(ws6, 2, headers_m, "1565C0", height=30)
+
+        # Recalcular con datos de costo del mes
+        month_prod = {}
+        for _order in completed_month:
+            for _ing in _order.get('ingredients', []):
+                pname = _ing.get('name', 'N/A')
+                qty   = _ing.get('quantity', 0)
+                sp    = _ing.get('sale_price', 0.0)
+                pp    = _ing.get('purchase_price', 0.0)
+                if pname in month_prod:
+                    month_prod[pname]['qty']      += qty
+                    month_prod[pname]['ingresos'] += qty * sp
+                    month_prod[pname]['costo']    += qty * pp
+                    month_prod[pname]['margen']   += qty * (sp - pp)
+                else:
+                    month_prod[pname] = {
+                        'producto': pname, 'qty': qty,
+                        'precio': sp,
+                        'ingresos': qty * sp, 'costo': qty * pp,
+                        'margen': qty * (sp - pp)
+                    }
+
+        sorted_month = sorted(month_prod.values(),
+                              key=lambda x: x['ingresos'], reverse=True)
+
+        fmt_m = {4: '$#,##0.00', 5: '$#,##0.00', 6: '$#,##0.00',
+                 7: '$#,##0.00', 8: '0.0"%"'}
+        for i, prod in enumerate(sorted_month, 3):
+            mg_pct = (prod['margen'] / prod['ingresos'] * 100
+                      if prod['ingresos'] > 0 else 0)
+            vals_m = [
+                i - 2,
+                prod['producto'],
+                prod['qty'],
+                prod['precio'],
+                prod['ingresos'],
+                prod['costo'],
+                prod['margen'],
+                round(mg_pct, 1),
+            ]
+            _data_row(ws6, i, vals_m, alt=(i % 2 == 0), fmt_map=fmt_m)
+
+        # Totales mes
+        if sorted_month:
+            tot_m = len(sorted_month) + 3
+            ws6.row_dimensions[tot_m].height = 22
+            tot_m_vals = [
+                "", "TOTALES DEL MES",
+                sum(p['qty']      for p in sorted_month),
+                "",
+                sum(p['ingresos'] for p in sorted_month),
+                sum(p['costo']    for p in sorted_month),
+                sum(p['margen']   for p in sorted_month),
+                "",
+            ]
+            for col, v in enumerate(tot_m_vals, 1):
+                c = ws6.cell(row=tot_m, column=col, value=v)
+                c.fill      = _fill(COLOR_AZUL)
+                c.font      = _font(bold=True, color=COLOR_BLANCO, size=11)
+                c.alignment = _align("center")
+                c.border    = _border()
+                if col in fmt_m and isinstance(v, (int, float)) and not isinstance(v, str):
+                    c.number_format = '$#,##0.00'
+
+        _auto_col_width(ws6, extra=4)
+
+        # ── Guardar en buffer ──────────────────────────────────────────────
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf
+
+    # ── Fin helper ─────────────────────────────────────────────────────────
+
+    try:
+        # ── Rangos de fecha ────────────────────────────────────────────────
+        today_utc      = datetime.now(timezone.utc).date()
+        start_of_day   = datetime(today_utc.year, today_utc.month,
+                                  today_utc.day, tzinfo=timezone.utc)
+        end_of_day     = start_of_day + timedelta(days=1)
+        start_of_month = datetime(today_utc.year, today_utc.month, 1,
+                                  tzinfo=timezone.utc)
 
         all_orders = get_cached_orders()
 
-        # Ventas completadas HOY
         completed_orders_today = [
             o for o in all_orders
             if o.get('status') == 'completed'
             and o.get('completed_at')
             and start_of_day <= o.get('completed_at') < end_of_day
         ]
-
-        # Ventas completadas del MES en curso
         completed_orders_month = [
             o for o in all_orders
             if o.get('status') == 'completed'
@@ -1207,69 +1706,123 @@ elif st.session_state.page == "📈 Reporte Diario":
             and start_of_month <= o.get('completed_at') < end_of_day
         ]
 
-        # --- Pre-calcular datos del día ANTES de los tabs (accesibles en ambos tabs) ---
-        total_revenue = sum(o.get('price', 0) for o in completed_orders_today)
-        total_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
-        total_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
+        # ── Pre-calcular datos del día ─────────────────────────────────────
+        total_revenue   = sum(o.get('price', 0) for o in completed_orders_today)
+        total_cash      = sum(o.get('price', 0) for o in completed_orders_today
+                              if o.get('payment_method') != 'fiado')
+        total_credit    = sum(o.get('price', 0) for o in completed_orders_today
+                              if o.get('payment_method') == 'fiado')
         num_transactions = len(completed_orders_today)
-        avg_ticket = total_revenue / num_transactions if num_transactions > 0 else 0
+        avg_ticket      = total_revenue / num_transactions if num_transactions > 0 else 0
+
+        # Costo y margen del día
+        total_cogs_day = 0.0
+        for _o in completed_orders_today:
+            for _ing in _o.get('ingredients', []):
+                _pp = _ing.get('purchase_price', 0.0)
+                _qq = _ing.get('quantity', 0)
+                if isinstance(_pp, (int, float)) and isinstance(_qq, (int, float)):
+                    total_cogs_day += _pp * _qq
+        gross_profit_day = total_revenue - total_cogs_day
+        margin_day_pct   = (gross_profit_day / total_revenue * 100) if total_revenue > 0 else 0
 
         # Consolidar productos vendidos hoy
         items_sold = {}
         for _order in completed_orders_today:
             for _item in _order.get('ingredients', []):
                 _name = _item.get('name', 'N/A')
-                _qty = _item.get('quantity', 0)
-                _sp = _item.get('sale_price', 0.0)
+                _qty  = _item.get('quantity', 0)
+                _sp   = _item.get('sale_price', 0.0)
+                _pp   = _item.get('purchase_price', 0.0)
                 if _name in items_sold:
-                    items_sold[_name]['Cantidad'] += _qty
-                    items_sold[_name]['Subtotal'] += (_qty * _sp)
+                    items_sold[_name]['Cantidad']  += _qty
+                    items_sold[_name]['Subtotal']  += _qty * _sp
+                    items_sold[_name]['Costo Tot.'] += _qty * _pp
+                    items_sold[_name]['Margen ($)'] += _qty * (_sp - _pp)
                 else:
                     items_sold[_name] = {
-                        'Producto': _name,
-                        'Cantidad': _qty,
-                        'Precio Unit.': _sp,
-                        'Subtotal': (_qty * _sp)
+                        'Producto':   _name,
+                        'Cantidad':   _qty,
+                        'P. Venta':   _sp,
+                        'P. Compra':  _pp,
+                        'Subtotal':   _qty * _sp,
+                        'Costo Tot.': _qty * _pp,
+                        'Margen ($)': _qty * (_sp - _pp),
                     }
 
         df_items_day = None
         if items_sold:
             df_items_day = pd.DataFrame(list(items_sold.values()))
-            df_items_day = df_items_day.sort_values(by='Cantidad', ascending=False)
+            df_items_day = df_items_day.sort_values('Subtotal', ascending=False)
 
-        # ============================================================
-        #  TABS: Reporte del Día  |  Análisis Mensual
-        # ============================================================
+        # ── Pre-calcular datos del mes ─────────────────────────────────────
+        month_revenue   = sum(o.get('price', 0) for o in completed_orders_month)
+        month_cogs      = 0.0
+        for _o in completed_orders_month:
+            for _ing in _o.get('ingredients', []):
+                _pp = _ing.get('purchase_price', 0.0)
+                _qq = _ing.get('quantity', 0)
+                if isinstance(_pp, (int, float)) and isinstance(_qq, (int, float)):
+                    month_cogs += _pp * _qq
+        month_profit    = month_revenue - month_cogs
+        month_margin    = (month_profit / month_revenue * 100) if month_revenue > 0 else 0
+        month_num_sales = len(completed_orders_month)
+
+        month_items_dict = {}
+        for _o in completed_orders_month:
+            for _ing in _o.get('ingredients', []):
+                _n = _ing.get('name', 'N/A')
+                _q = _ing.get('quantity', 0)
+                _s = _ing.get('sale_price', 0.0)
+                if _n in month_items_dict:
+                    month_items_dict[_n]['Unidades'] += _q
+                    month_items_dict[_n]['Ingresos'] += _q * _s
+                else:
+                    month_items_dict[_n] = {
+                        'Producto': _n, 'Unidades': _q, 'Ingresos': _q * _s
+                    }
+
+        # ══════════════════════════════════════════════════════════════════
+        #  TABS
+        # ══════════════════════════════════════════════════════════════════
         tab_dia, tab_mes = st.tabs(["📊 Reporte del Día", "📅 Análisis Mensual"])
 
-        # ────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────
         #  TAB 1 — REPORTE DEL DÍA
-        # ────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────
         with tab_dia:
             if not completed_orders_today:
                 st.warning(f"No hay ventas registradas para hoy ({today_utc.strftime('%d/%m/%Y')}).")
             else:
-                # --- 1. KPIs Diarios (5 columnas) ---
-                k1, k2, k3, k4, k5 = st.columns(5)
-                k1.metric("💰 Total Vendido", f"${total_revenue:,.2f}")
-                k2.metric("💵 Efectivo", f"${total_cash:,.2f}")
-                k3.metric("📝 Fiado", f"${total_credit:,.2f}")
-                k4.metric("🧾 Transacciones", num_transactions)
-                k5.metric("🎯 Ticket Promedio", f"${avg_ticket:,.2f}")
+                # ── 1. KPIs (6 columnas) ──────────────────────────────
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
+                k1.metric("💰 Total Vendido",     f"${total_revenue:,.2f}")
+                k2.metric("💵 Efectivo",           f"${total_cash:,.2f}")
+                k3.metric("📝 Fiado",              f"${total_credit:,.2f}")
+                k4.metric("📦 Costo Mercancía",    f"${total_cogs_day:,.2f}")
+                k5.metric("📈 Beneficio Bruto",    f"${gross_profit_day:,.2f}")
+                k6.metric("🎯 Margen del Día",     f"{margin_day_pct:.1f}%")
+
+                st.markdown("---")
+                c_l, c_r = st.columns(2)
+                c_l.metric("🧾 Transacciones", num_transactions)
+                c_r.metric("🎯 Ticket Promedio", f"${avg_ticket:,.2f}")
 
                 st.markdown("---")
 
-                # --- 2. Productos Vendidos Hoy (tabla consolidada) ---
+                # ── 2. Productos vendidos hoy ─────────────────────────
                 st.subheader("📦 Productos Vendidos Hoy")
-
                 if df_items_day is not None:
                     st.dataframe(
                         df_items_day,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "Precio Unit.": st.column_config.NumberColumn(format="$%.2f"),
-                            "Subtotal": st.column_config.NumberColumn(format="$%.2f")
+                            "P. Venta":   st.column_config.NumberColumn(format="$%.2f"),
+                            "P. Compra":  st.column_config.NumberColumn(format="$%.2f"),
+                            "Subtotal":   st.column_config.NumberColumn(format="$%.2f"),
+                            "Costo Tot.": st.column_config.NumberColumn(format="$%.2f"),
+                            "Margen ($)": st.column_config.NumberColumn(format="$%.2f"),
                         }
                     )
                 else:
@@ -1277,194 +1830,147 @@ elif st.session_state.page == "📈 Reporte Diario":
 
                 st.markdown("---")
 
-                # --- 3. Desglose por Método de Pago ---
+                # ── 3. Desglose por método de pago ────────────────────
                 st.subheader("💳 Desglose por Método de Pago")
-                cash_orders = [o for o in completed_orders_today if o.get('payment_method') != 'fiado']
-                credit_orders = [o for o in completed_orders_today if o.get('payment_method') == 'fiado']
-
-                df_payment = pd.DataFrame([
-                    {
-                        "Método": "💵 Efectivo",
-                        "N° Ventas": len(cash_orders),
-                        "Total": sum(o.get('price', 0) for o in cash_orders)
-                    },
-                    {
-                        "Método": "📝 Fiado (Crédito)",
-                        "N° Ventas": len(credit_orders),
-                        "Total": sum(o.get('price', 0) for o in credit_orders)
-                    }
+                cash_orders   = [o for o in completed_orders_today
+                                 if o.get('payment_method') != 'fiado']
+                credit_orders = [o for o in completed_orders_today
+                                 if o.get('payment_method') == 'fiado']
+                df_pay = pd.DataFrame([
+                    {"Método": "💵 Efectivo",
+                     "N° Ventas": len(cash_orders),
+                     "Total ($)": sum(o.get('price', 0) for o in cash_orders)},
+                    {"Método": "📝 Fiado/Crédito",
+                     "N° Ventas": len(credit_orders),
+                     "Total ($)": sum(o.get('price', 0) for o in credit_orders)},
                 ])
-                st.dataframe(
-                    df_payment,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Total": st.column_config.NumberColumn(format="$%.2f")
-                    }
-                )
+                st.dataframe(df_pay, use_container_width=True, hide_index=True,
+                             column_config={"Total ($)": st.column_config.NumberColumn(format="$%.2f")})
 
-                # Mostrar deudores si hay ventas fiadas
                 if credit_orders:
                     st.caption("📋 **Clientes con ventas fiadas hoy:**")
                     for co in credit_orders:
-                        customer = co.get('customer_name', 'Sin nombre')
-                        amount = co.get('price', 0)
-                        st.markdown(f"- **{customer}**: ${amount:,.2f}")
+                        st.markdown(
+                            f"- **{co.get('customer_name','Sin nombre')}**: "
+                            f"${co.get('price',0):,.2f}")
 
                 st.markdown("---")
 
-                # --- 4. Detalle de Transacciones del Día ---
+                # ── 4. Detalle de transacciones ───────────────────────
                 st.subheader("📝 Detalle de Transacciones del Día")
                 for idx, order in enumerate(completed_orders_today, 1):
-                    order_title = order.get('title', 'Sin título')
-                    order_total = order.get('price', 0)
-                    order_method = "Fiado" if order.get('payment_method') == 'fiado' else "Efectivo"
-                    order_customer = order.get('customer_name', '')
-
                     ca = order.get('completed_at')
-                    if ca and isinstance(ca, datetime):
-                        order_time = ca.astimezone(_COL_TZ).strftime("%I:%M %p").lstrip("0")
-                    else:
-                        order_time = "N/A"
-
-                    header_text = f"**#{idx}** — {order_title} | ${order_total:,.2f} | {order_method} | {order_time}"
-                    with st.expander(header_text):
-                        if order_customer and order_customer != "Cliente General":
-                            st.markdown(f"👤 **Cliente:** {order_customer}")
+                    order_time = (ca.astimezone(_COL_TZ).strftime("%I:%M %p").lstrip("0")
+                                  if ca and isinstance(ca, datetime) else "N/A")
+                    metodo = "Fiado" if order.get('payment_method') == 'fiado' else "Efectivo"
+                    header_txt = (f"**#{idx}** — {order.get('title','Sin título')} "
+                                  f"| ${order.get('price',0):,.2f} | {metodo} | {order_time}")
+                    with st.expander(header_txt):
+                        cust = order.get('customer_name', '')
+                        if cust and cust != "Cliente General":
+                            st.markdown(f"👤 **Cliente:** {cust}")
                         st.markdown("**Productos:**")
                         for item in order.get('ingredients', []):
-                            item_name = item.get('name', 'N/A')
-                            item_qty = item.get('quantity', 0)
-                            item_price = item.get('sale_price', 0.0)
-                            st.markdown(f"- {item_name} × {item_qty} = ${item_qty * item_price:,.2f}")
+                            n = item.get('name', 'N/A')
+                            q = item.get('quantity', 0)
+                            p = item.get('sale_price', 0.0)
+                            c_u = item.get('purchase_price', 0.0)
+                            mg  = (p - c_u) * q
+                            st.markdown(
+                                f"- **{n}** × {q} · Venta: ${p*q:,.2f} "
+                                f"· Costo: ${c_u*q:,.2f} · Margen: ${mg:,.2f}")
 
                 st.markdown("---")
 
-                # --- 5. Descarga Excel Mejorada ---
-                st.subheader("📥 Descargar Reporte")
-                output_day = io.BytesIO()
-                with pd.ExcelWriter(output_day, engine='openpyxl') as writer:
-                    pd.DataFrame([{
-                        "Fecha": _fecha_legible,
-                        "Total Vendido ($)": total_revenue,
-                        "Efectivo ($)": total_cash,
-                        "Fiado ($)": total_credit,
-                        "N° Transacciones": num_transactions,
-                        "Ticket Promedio ($)": round(avg_ticket, 2)
-                    }]).to_excel(writer, sheet_name='Resumen_Diario', index=False)
+                # ── 5. Descarga Excel profesional ─────────────────────
+                st.subheader("📥 Descargar Reporte Profesional (Excel)")
+                st.info("El Excel incluye **7 hojas**: Portada · Resumen Diario · "
+                        "Ventas Detalladas · Productos Hoy · Clientes Fiado · "
+                        "Resumen Mensual · Productos del Mes — con colores, "
+                        "márgenes de beneficio y análisis de costos.")
 
-                    if df_items_day is not None:
-                        df_items_day.to_excel(writer, sheet_name='Productos_Vendidos_Hoy', index=False)
-
-                output_day.seek(0)
-
+                excel_buf = _build_professional_excel(
+                    _fecha_legible, _hora_legible, _mes_actual,
+                    completed_orders_today, items_sold, df_items_day,
+                    total_revenue, total_cash, total_credit,
+                    num_transactions, avg_ticket,
+                    total_cogs_day, gross_profit_day,
+                    completed_orders_month, month_revenue, month_cogs,
+                    month_profit, month_margin, month_num_sales,
+                    month_items_dict,
+                )
                 st.download_button(
-                    label="⬇️ Descargar Reporte del Día (Excel)",
-                    data=output_day,
-                    file_name=f"Reporte_Diario_{today_utc.strftime('%Y%m%d')}.xlsx",
+                    label="⬇️ Descargar Reporte Completo Profesional (Excel)",
+                    data=excel_buf,
+                    file_name=f"Reporte_SAVA_{today_utc.strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
-                    use_container_width=True
+                    use_container_width=True,
                 )
 
-        # ────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────
         #  TAB 2 — ANÁLISIS MENSUAL
-        # ────────────────────────────────────────────────────────────
+        # ────────────────────────────────────────────────────────────────
         with tab_mes:
-            _mes_actual = f"{_MESES_ES[_now_col.month].capitalize()} {_now_col.year}"
             st.subheader(f"📅 Análisis Mensual — {_mes_actual}")
 
             if not completed_orders_month:
                 st.warning(f"No hay ventas completadas en {_mes_actual}.")
             else:
-                # --- 1. KPIs Mensuales ---
-                month_revenue = sum(o.get('price', 0) for o in completed_orders_month)
-                month_cogs = 0
-                for o in completed_orders_month:
-                    for ing in o.get('ingredients', []):
-                        pp = ing.get('purchase_price', 0.0)
-                        qq = ing.get('quantity', 0)
-                        if isinstance(pp, (int, float)) and isinstance(qq, (int, float)):
-                            month_cogs += pp * qq
-
-                month_profit = month_revenue - month_cogs
-                month_margin = (month_profit / month_revenue) * 100 if month_revenue > 0 else 0
-                month_num_sales = len(completed_orders_month)
-
+                # ── 1. KPIs mensuales ─────────────────────────────────
                 mk1, mk2, mk3, mk4, mk5 = st.columns(5)
-                mk1.metric("💰 Ingresos del Mes", f"${month_revenue:,.2f}")
-                mk2.metric("📦 Costo Acumulado", f"${month_cogs:,.2f}")
-                mk3.metric("📈 Beneficio Bruto", f"${month_profit:,.2f}")
-                mk4.metric("📊 Margen de Beneficio", f"{month_margin:.1f}%")
-                mk5.metric("🧾 Ventas del Mes", month_num_sales)
+                mk1.metric("💰 Ingresos del Mes",    f"${month_revenue:,.2f}")
+                mk2.metric("📦 Costo Acumulado",     f"${month_cogs:,.2f}")
+                mk3.metric("📈 Beneficio Bruto",     f"${month_profit:,.2f}")
+                mk4.metric("📊 Margen del Mes",      f"{month_margin:.1f}%")
+                mk5.metric("🧾 Ventas del Mes",      month_num_sales)
 
                 st.markdown("---")
 
-                # --- 2. Gráfico de Tendencia Diaria del Mes ---
+                # ── 2. Gráfico de tendencia ───────────────────────────
                 st.subheader("📈 Tendencia de Ventas Diarias del Mes")
-                import plotly.express as px  # Lazy import (igual que en Analítica)
+                import plotly.express as px  # Lazy import
 
-                daily_data_month = []
+                daily_data = []
                 for o in completed_orders_month:
                     ca = o.get('completed_at')
                     if ca and isinstance(ca, datetime):
-                        daily_data_month.append({
-                            'Fecha': ca.date(),
+                        daily_data.append({
+                            'Fecha':    ca.date(),
                             'Ingresos': o.get('price', 0)
                         })
 
-                if daily_data_month:
-                    df_daily_month = pd.DataFrame(daily_data_month)
-                    df_daily_month['Fecha'] = pd.to_datetime(df_daily_month['Fecha'])
-                    df_daily_agg = df_daily_month.groupby('Fecha').agg(
+                if daily_data:
+                    df_daily = pd.DataFrame(daily_data)
+                    df_daily['Fecha'] = pd.to_datetime(df_daily['Fecha'])
+                    df_agg = df_daily.groupby('Fecha').agg(
                         Ingresos=('Ingresos', 'sum'),
                         Ventas=('Ingresos', 'count')
                     ).reset_index()
 
-                    fig_month = px.bar(
-                        df_daily_agg, x='Fecha', y='Ingresos',
+                    fig = px.bar(
+                        df_agg, x='Fecha', y='Ingresos',
                         title=f"Ingresos Diarios — {_mes_actual}",
                         labels={'Ingresos': 'Ingresos ($)', 'Fecha': 'Día'},
-                        text_auto='$.2s'
+                        text_auto='$.2s', color='Ingresos',
+                        color_continuous_scale='Greens',
                     )
-                    fig_month.update_traces(marker_color='#4CAF50')
-                    fig_month.update_layout(
+                    fig.update_layout(
                         xaxis_tickformat='%d %b',
-                        yaxis_tickprefix='$',
-                        yaxis_tickformat=',.0f'
+                        yaxis_tickprefix='$', yaxis_tickformat=',.0f',
+                        showlegend=False,
                     )
-                    st.plotly_chart(fig_month, use_container_width=True)
-                else:
-                    st.info("No hay datos de fecha suficientes para generar el gráfico.")
+                    st.plotly_chart(fig, use_container_width=True)
 
                 st.markdown("---")
 
-                # --- 3. Top 5 Productos del Mes ---
-                st.subheader("🏆 Top 5 Productos Más Vendidos del Mes")
-                month_items = {}
-                for o in completed_orders_month:
-                    for ing in o.get('ingredients', []):
-                        name = ing.get('name', 'N/A')
-                        qty = ing.get('quantity', 0)
-                        sp = ing.get('sale_price', 0.0)
-                        if name in month_items:
-                            month_items[name]['Unidades'] += qty
-                            month_items[name]['Ingresos'] += qty * sp
-                        else:
-                            month_items[name] = {
-                                'Producto': name,
-                                'Unidades': qty,
-                                'Ingresos': qty * sp
-                            }
-
-                if month_items:
-                    df_month_items = pd.DataFrame(list(month_items.values()))
-                    df_top5 = df_month_items.sort_values('Unidades', ascending=False).head(5)
-
+                # ── 3. Top productos del mes ──────────────────────────
+                st.subheader("🏆 Top Productos del Mes")
+                if month_items_dict:
+                    df_top = pd.DataFrame(list(month_items_dict.values()))
+                    df_top = df_top.sort_values('Ingresos', ascending=False).head(10)
                     st.dataframe(
-                        df_top5,
-                        use_container_width=True,
-                        hide_index=True,
+                        df_top, use_container_width=True, hide_index=True,
                         column_config={
                             "Ingresos": st.column_config.NumberColumn(format="$%.2f")
                         }
@@ -1472,79 +1978,41 @@ elif st.session_state.page == "📈 Reporte Diario":
 
                 st.markdown("---")
 
-                # --- 4. Comparativa Día vs Mes ---
+                # ── 4. Comparativa Hoy vs. Mes ────────────────────────
                 st.subheader("⚡ Comparativa: Hoy vs. Mes")
-                day_pct = (total_revenue / month_revenue * 100) if month_revenue > 0 else 0
-                month_avg_daily = month_revenue / max(_now_col.day, 1)
+                day_pct      = (total_revenue / month_revenue * 100) if month_revenue > 0 else 0
+                month_avg_d  = month_revenue / max(_now_col.day, 1)
+                diff_vs_avg  = ((total_revenue - month_avg_d) / month_avg_d * 100) if month_avg_d > 0 else 0
 
-                cmp1, cmp2, cmp3 = st.columns(3)
-                cmp1.metric(
-                    "📊 Participación del Día",
-                    f"{day_pct:.1f}%",
-                    help="Porcentaje de los ingresos de hoy respecto al total del mes"
-                )
-                cmp2.metric(
-                    "📈 Promedio Diario del Mes",
-                    f"${month_avg_daily:,.2f}",
-                    help="Ingreso promedio por día en el mes en curso"
-                )
-                if total_revenue > 0 and month_avg_daily > 0:
-                    diff_vs_avg = ((total_revenue - month_avg_daily) / month_avg_daily) * 100
-                    cmp3.metric(
-                        "🔄 Hoy vs. Promedio",
-                        f"${total_revenue:,.2f}",
-                        delta=f"{diff_vs_avg:+.1f}%",
-                        help="Comparación del ingreso de hoy contra el promedio diario del mes"
-                    )
-                else:
-                    cmp3.metric("🔄 Hoy vs. Promedio", f"${total_revenue:,.2f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("📊 Participación del Día", f"{day_pct:.1f}%")
+                c2.metric("📈 Promedio Diario del Mes", f"${month_avg_d:,.2f}")
+                c3.metric("🔄 Hoy vs. Promedio",
+                          f"${total_revenue:,.2f}",
+                          delta=f"{diff_vs_avg:+.1f}%")
 
                 st.markdown("---")
 
-                # --- 5. Descarga Excel Completa (Día + Mes) ---
-                st.subheader("📥 Descargar Reporte Completo (Día + Mes)")
-                output_full = io.BytesIO()
-                with pd.ExcelWriter(output_full, engine='openpyxl') as writer:
-                    # Hoja 1: Resumen Diario (usa variables pre-calculadas)
-                    pd.DataFrame([{
-                        "Fecha": _fecha_legible,
-                        "Total Vendido ($)": total_revenue,
-                        "Efectivo ($)": total_cash,
-                        "Fiado ($)": total_credit,
-                        "N° Transacciones": num_transactions,
-                        "Ticket Promedio ($)": round(avg_ticket, 2)
-                    }]).to_excel(writer, sheet_name='Resumen_Diario', index=False)
-
-                    # Hoja 2: Productos Vendidos Hoy
-                    if df_items_day is not None:
-                        df_items_day.to_excel(writer, sheet_name='Productos_Vendidos_Hoy', index=False)
-
-                    # Hoja 3: Resumen Mensual
-                    pd.DataFrame([{
-                        "Mes": _mes_actual,
-                        "Ingresos Totales ($)": month_revenue,
-                        "Costo Acumulado ($)": month_cogs,
-                        "Beneficio Bruto ($)": month_profit,
-                        "Margen de Beneficio (%)": round(month_margin, 2),
-                        "N° Ventas": month_num_sales
-                    }]).to_excel(writer, sheet_name='Resumen_Mensual', index=False)
-
-                    # Hoja 4: Productos Vendidos del Mes
-                    if month_items:
-                        df_all_month = pd.DataFrame(list(month_items.values()))
-                        df_all_month.sort_values('Unidades', ascending=False).to_excel(
-                            writer, sheet_name='Productos_Vendidos_Mes', index=False
-                        )
-
-                output_full.seek(0)
-
+                # ── 5. Descarga Excel (mismo botón desde aquí también) ─
+                st.subheader("📥 Descargar Reporte Completo")
+                excel_buf2 = _build_professional_excel(
+                    _fecha_legible, _hora_legible, _mes_actual,
+                    completed_orders_today, items_sold, df_items_day,
+                    total_revenue, total_cash, total_credit,
+                    num_transactions, avg_ticket,
+                    total_cogs_day, gross_profit_day,
+                    completed_orders_month, month_revenue, month_cogs,
+                    month_profit, month_margin, month_num_sales,
+                    month_items_dict,
+                )
                 st.download_button(
-                    label="⬇️ Descargar Reporte Completo Día + Mes (Excel)",
-                    data=output_full,
-                    file_name=f"Reporte_Completo_{today_utc.strftime('%Y%m%d')}.xlsx",
+                    label="⬇️ Descargar Reporte Completo Profesional (Excel)",
+                    data=excel_buf2,
+                    file_name=f"Reporte_SAVA_{today_utc.strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
-                    use_container_width=True
+                    use_container_width=True,
+                    key="dl_excel_mes",
                 )
 
     except Exception as e:
