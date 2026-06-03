@@ -1164,81 +1164,394 @@ elif st.session_state.page == "📊 Analítica":
 
 
 elif st.session_state.page == "📈 Reporte Diario":
+    # --- Zona horaria Colombia (UTC-5) ---
+    _COL_TZ = timezone(timedelta(hours=-5))
+    _now_col = datetime.now(_COL_TZ)
+    _MESES_ES = {
+        1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
+        5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
+        9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+    }
+    _fecha_legible = f"{_now_col.day} de {_MESES_ES[_now_col.month]} de {_now_col.year}"
+    _hora_legible = _now_col.strftime("%I:%M %p").lstrip("0")
+
     st.subheader("📊 Reporte Diario de Ventas")
-    st.info("Resumen exacto de las ventas de hoy y los productos vendidos.")
+    st.markdown(
+        f"📅 **Fecha:** {_fecha_legible} — 🕐 **Hora:** {_hora_legible}",
+    )
+    st.markdown("---")
 
     try:
+        # --- Calcular rangos de fecha ---
         today_utc = datetime.now(timezone.utc).date()
         start_of_day = datetime(today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc)
         end_of_day = start_of_day + timedelta(days=1)
 
+        start_of_month = datetime(today_utc.year, today_utc.month, 1, tzinfo=timezone.utc)
+
         all_orders = get_cached_orders()
+
+        # Ventas completadas HOY
         completed_orders_today = [
-            o for o in all_orders 
-            if o.get('status') == 'completed' 
-            and o.get('completed_at') 
+            o for o in all_orders
+            if o.get('status') == 'completed'
+            and o.get('completed_at')
             and start_of_day <= o.get('completed_at') < end_of_day
         ]
 
-        if not completed_orders_today:
-            st.warning(f"No hay ventas registradas para hoy ({today_utc.strftime('%d/%m/%Y')}).")
-        else:
-            # Calcular totales
-            total_revenue = sum(o.get('price', 0) for o in completed_orders_today)
-            total_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
-            total_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("💰 Total Vendido", f"${total_revenue:,.2f}")
-            col2.metric("💵 Recibido en Efectivo", f"${total_cash:,.2f}")
-            col3.metric("📝 Total Fiado", f"${total_credit:,.2f}")
-            
-            st.markdown("---")
-            st.subheader("📦 Productos Vendidos Hoy")
-            
-            # Consolidar productos vendidos
-            items_sold = {}
-            for order in completed_orders_today:
-                for item in order.get('ingredients', []):
-                    name = item.get('name', 'N/A')
-                    qty = item.get('quantity', 0)
-                    sale_price = item.get('sale_price', 0.0)
-                    
-                    if name in items_sold:
-                        items_sold[name]['Cantidad'] += qty
-                        items_sold[name]['Subtotal'] += (qty * sale_price)
-                    else:
-                        items_sold[name] = {
-                            'Producto': name,
-                            'Cantidad': qty,
-                            'Precio Unit.': sale_price,
-                            'Subtotal': (qty * sale_price)
+        # Ventas completadas del MES en curso
+        completed_orders_month = [
+            o for o in all_orders
+            if o.get('status') == 'completed'
+            and o.get('completed_at')
+            and start_of_month <= o.get('completed_at') < end_of_day
+        ]
+
+        # ============================================================
+        #  TABS: Reporte del Día  |  Análisis Mensual
+        # ============================================================
+        tab_dia, tab_mes = st.tabs(["📊 Reporte del Día", "📅 Análisis Mensual"])
+
+        # ────────────────────────────────────────────────────────────
+        #  TAB 1 — REPORTE DEL DÍA
+        # ────────────────────────────────────────────────────────────
+        with tab_dia:
+            if not completed_orders_today:
+                st.warning(f"No hay ventas registradas para hoy ({today_utc.strftime('%d/%m/%Y')}).")
+            else:
+                # --- 1. KPIs Diarios (5 columnas) ---
+                total_revenue = sum(o.get('price', 0) for o in completed_orders_today)
+                total_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
+                total_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
+                num_transactions = len(completed_orders_today)
+                avg_ticket = total_revenue / num_transactions if num_transactions > 0 else 0
+
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("💰 Total Vendido", f"${total_revenue:,.2f}")
+                k2.metric("💵 Efectivo", f"${total_cash:,.2f}")
+                k3.metric("📝 Fiado", f"${total_credit:,.2f}")
+                k4.metric("🧾 Transacciones", num_transactions)
+                k5.metric("🎯 Ticket Promedio", f"${avg_ticket:,.2f}")
+
+                st.markdown("---")
+
+                # --- 2. Productos Vendidos Hoy (tabla consolidada) ---
+                st.subheader("📦 Productos Vendidos Hoy")
+
+                items_sold = {}
+                for order in completed_orders_today:
+                    for item in order.get('ingredients', []):
+                        name = item.get('name', 'N/A')
+                        qty = item.get('quantity', 0)
+                        sale_price = item.get('sale_price', 0.0)
+
+                        if name in items_sold:
+                            items_sold[name]['Cantidad'] += qty
+                            items_sold[name]['Subtotal'] += (qty * sale_price)
+                        else:
+                            items_sold[name] = {
+                                'Producto': name,
+                                'Cantidad': qty,
+                                'Precio Unit.': sale_price,
+                                'Subtotal': (qty * sale_price)
+                            }
+
+                if items_sold:
+                    df_items_day = pd.DataFrame(list(items_sold.values()))
+                    df_items_day = df_items_day.sort_values(by='Cantidad', ascending=False)
+
+                    st.dataframe(
+                        df_items_day,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Precio Unit.": st.column_config.NumberColumn(format="$%.2f"),
+                            "Subtotal": st.column_config.NumberColumn(format="$%.2f")
                         }
-            
-            if items_sold:
-                df_items = pd.DataFrame(list(items_sold.values()))
-                df_items = df_items.sort_values(by='Cantidad', ascending=False)
-                
+                    )
+
+                st.markdown("---")
+
+                # --- 3. Desglose por Método de Pago ---
+                st.subheader("💳 Desglose por Método de Pago")
+                cash_orders = [o for o in completed_orders_today if o.get('payment_method') != 'fiado']
+                credit_orders = [o for o in completed_orders_today if o.get('payment_method') == 'fiado']
+
+                df_payment = pd.DataFrame([
+                    {
+                        "Método": "💵 Efectivo",
+                        "N° Ventas": len(cash_orders),
+                        "Total": sum(o.get('price', 0) for o in cash_orders)
+                    },
+                    {
+                        "Método": "📝 Fiado (Crédito)",
+                        "N° Ventas": len(credit_orders),
+                        "Total": sum(o.get('price', 0) for o in credit_orders)
+                    }
+                ])
                 st.dataframe(
-                    df_items, 
-                    use_container_width=True, 
+                    df_payment,
+                    use_container_width=True,
                     hide_index=True,
                     column_config={
-                        "Precio Unit.": st.column_config.NumberColumn(format="$%.2f"),
-                        "Subtotal": st.column_config.NumberColumn(format="$%.2f")
+                        "Total": st.column_config.NumberColumn(format="$%.2f")
                     }
                 )
-                
-                # Generar Excel para descargar
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_items.to_excel(writer, sheet_name='Productos_Vendidos', index=False)
-                output.seek(0)
-                
+
+                # Mostrar deudores si hay ventas fiadas
+                if credit_orders:
+                    st.caption("📋 **Clientes con ventas fiadas hoy:**")
+                    for co in credit_orders:
+                        customer = co.get('customer_name', 'Sin nombre')
+                        amount = co.get('price', 0)
+                        st.markdown(f"- **{customer}**: ${amount:,.2f}")
+
+                st.markdown("---")
+
+                # --- 4. Detalle de Transacciones del Día ---
+                st.subheader("📝 Detalle de Transacciones del Día")
+                for idx, order in enumerate(completed_orders_today, 1):
+                    order_title = order.get('title', 'Sin título')
+                    order_total = order.get('price', 0)
+                    order_method = "Fiado" if order.get('payment_method') == 'fiado' else "Efectivo"
+                    order_customer = order.get('customer_name', '')
+
+                    # Obtener hora de completación
+                    ca = order.get('completed_at')
+                    if ca and isinstance(ca, datetime):
+                        order_time = ca.astimezone(_COL_TZ).strftime("%I:%M %p").lstrip("0")
+                    else:
+                        order_time = "N/A"
+
+                    header_text = f"**#{idx}** — {order_title} | ${order_total:,.2f} | {order_method} | {order_time}"
+                    with st.expander(header_text):
+                        if order_customer and order_customer != "Cliente General":
+                            st.markdown(f"👤 **Cliente:** {order_customer}")
+                        st.markdown("**Productos:**")
+                        for item in order.get('ingredients', []):
+                            item_name = item.get('name', 'N/A')
+                            item_qty = item.get('quantity', 0)
+                            item_price = item.get('sale_price', 0.0)
+                            st.markdown(f"- {item_name} × {item_qty} = ${item_qty * item_price:,.2f}")
+
+                st.markdown("---")
+
+                # --- 5. Descarga Excel Mejorada ---
+                st.subheader("📥 Descargar Reporte")
+                output_day = io.BytesIO()
+                with pd.ExcelWriter(output_day, engine='openpyxl') as writer:
+                    # Hoja 1: Resumen del día
+                    df_resumen = pd.DataFrame([{
+                        "Fecha": _fecha_legible,
+                        "Total Vendido ($)": total_revenue,
+                        "Efectivo ($)": total_cash,
+                        "Fiado ($)": total_credit,
+                        "N° Transacciones": num_transactions,
+                        "Ticket Promedio ($)": round(avg_ticket, 2)
+                    }])
+                    df_resumen.to_excel(writer, sheet_name='Resumen_Diario', index=False)
+
+                    # Hoja 2: Productos vendidos hoy
+                    if items_sold:
+                        df_items_day.to_excel(writer, sheet_name='Productos_Vendidos_Hoy', index=False)
+
+                output_day.seek(0)
+
                 st.download_button(
-                    label="⬇️ Descargar Reporte de Hoy (Excel)",
-                    data=output,
+                    label="⬇️ Descargar Reporte del Día (Excel)",
+                    data=output_day,
                     file_name=f"Reporte_Diario_{today_utc.strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
+
+        # ────────────────────────────────────────────────────────────
+        #  TAB 2 — ANÁLISIS MENSUAL
+        # ────────────────────────────────────────────────────────────
+        with tab_mes:
+            _mes_actual = f"{_MESES_ES[_now_col.month].capitalize()} {_now_col.year}"
+            st.subheader(f"📅 Análisis Mensual — {_mes_actual}")
+
+            if not completed_orders_month:
+                st.warning(f"No hay ventas completadas en {_mes_actual}.")
+            else:
+                # --- 1. KPIs Mensuales ---
+                month_revenue = sum(o.get('price', 0) for o in completed_orders_month)
+                month_cogs = 0
+                for o in completed_orders_month:
+                    for ing in o.get('ingredients', []):
+                        pp = ing.get('purchase_price', 0.0)
+                        qq = ing.get('quantity', 0)
+                        if isinstance(pp, (int, float)) and isinstance(qq, (int, float)):
+                            month_cogs += pp * qq
+
+                month_profit = month_revenue - month_cogs
+                month_margin = (month_profit / month_revenue) * 100 if month_revenue > 0 else 0
+                month_num_sales = len(completed_orders_month)
+
+                mk1, mk2, mk3, mk4, mk5 = st.columns(5)
+                mk1.metric("💰 Ingresos del Mes", f"${month_revenue:,.2f}")
+                mk2.metric("📦 Costo Acumulado", f"${month_cogs:,.2f}")
+                mk3.metric("📈 Beneficio Bruto", f"${month_profit:,.2f}")
+                mk4.metric("📊 Margen de Beneficio", f"{month_margin:.1f}%")
+                mk5.metric("🧾 Ventas del Mes", month_num_sales)
+
+                st.markdown("---")
+
+                # --- 2. Gráfico de Tendencia Diaria del Mes ---
+                st.subheader("📈 Tendencia de Ventas Diarias del Mes")
+                import plotly.express as px  # Lazy import (igual que en Analítica)
+
+                daily_data_month = []
+                for o in completed_orders_month:
+                    ca = o.get('completed_at')
+                    if ca and isinstance(ca, datetime):
+                        daily_data_month.append({
+                            'Fecha': ca.date(),
+                            'Ingresos': o.get('price', 0)
+                        })
+
+                if daily_data_month:
+                    df_daily_month = pd.DataFrame(daily_data_month)
+                    df_daily_month['Fecha'] = pd.to_datetime(df_daily_month['Fecha'])
+                    df_daily_agg = df_daily_month.groupby('Fecha').agg(
+                        Ingresos=('Ingresos', 'sum'),
+                        Ventas=('Ingresos', 'count')
+                    ).reset_index()
+
+                    fig_month = px.bar(
+                        df_daily_agg, x='Fecha', y='Ingresos',
+                        title=f"Ingresos Diarios — {_mes_actual}",
+                        labels={'Ingresos': 'Ingresos ($)', 'Fecha': 'Día'},
+                        text_auto='$.2s'
+                    )
+                    fig_month.update_traces(marker_color='#4CAF50')
+                    fig_month.update_layout(
+                        xaxis_tickformat='%d %b',
+                        yaxis_tickprefix='$',
+                        yaxis_tickformat=',.0f'
+                    )
+                    st.plotly_chart(fig_month, use_container_width=True)
+                else:
+                    st.info("No hay datos de fecha suficientes para generar el gráfico.")
+
+                st.markdown("---")
+
+                # --- 3. Top 5 Productos del Mes ---
+                st.subheader("🏆 Top 5 Productos Más Vendidos del Mes")
+                month_items = {}
+                for o in completed_orders_month:
+                    for ing in o.get('ingredients', []):
+                        name = ing.get('name', 'N/A')
+                        qty = ing.get('quantity', 0)
+                        sp = ing.get('sale_price', 0.0)
+                        if name in month_items:
+                            month_items[name]['Unidades'] += qty
+                            month_items[name]['Ingresos'] += qty * sp
+                        else:
+                            month_items[name] = {
+                                'Producto': name,
+                                'Unidades': qty,
+                                'Ingresos': qty * sp
+                            }
+
+                if month_items:
+                    df_month_items = pd.DataFrame(list(month_items.values()))
+                    df_top5 = df_month_items.sort_values('Unidades', ascending=False).head(5)
+
+                    st.dataframe(
+                        df_top5,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Ingresos": st.column_config.NumberColumn(format="$%.2f")
+                        }
+                    )
+
+                st.markdown("---")
+
+                # --- 4. Comparativa Día vs Mes ---
+                st.subheader("⚡ Comparativa: Hoy vs. Mes")
+                day_revenue = sum(o.get('price', 0) for o in completed_orders_today)
+                day_pct = (day_revenue / month_revenue * 100) if month_revenue > 0 else 0
+                day_sales_count = len(completed_orders_today)
+                month_avg_daily = month_revenue / max(_now_col.day, 1)
+
+                cmp1, cmp2, cmp3 = st.columns(3)
+                cmp1.metric(
+                    "📊 Participación del Día",
+                    f"{day_pct:.1f}%",
+                    help="Porcentaje de los ingresos de hoy respecto al total del mes"
+                )
+                cmp2.metric(
+                    "📈 Promedio Diario del Mes",
+                    f"${month_avg_daily:,.2f}",
+                    help="Ingreso promedio por día en el mes en curso"
+                )
+                if day_revenue > 0 and month_avg_daily > 0:
+                    diff_vs_avg = ((day_revenue - month_avg_daily) / month_avg_daily) * 100
+                    cmp3.metric(
+                        "🔄 Hoy vs. Promedio",
+                        f"${day_revenue:,.2f}",
+                        delta=f"{diff_vs_avg:+.1f}%",
+                        help="Comparación del ingreso de hoy contra el promedio diario del mes"
+                    )
+                else:
+                    cmp3.metric("🔄 Hoy vs. Promedio", f"${day_revenue:,.2f}")
+
+                st.markdown("---")
+
+                # --- 5. Descarga Excel Completa (Día + Mes) ---
+                st.subheader("📥 Descargar Reporte Completo (Día + Mes)")
+                output_full = io.BytesIO()
+                with pd.ExcelWriter(output_full, engine='openpyxl') as writer:
+                    # Hoja 1: Resumen Diario
+                    day_rev = sum(o.get('price', 0) for o in completed_orders_today)
+                    day_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
+                    day_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
+                    day_count = len(completed_orders_today)
+                    day_avg = day_rev / day_count if day_count > 0 else 0
+
+                    pd.DataFrame([{
+                        "Fecha": _fecha_legible,
+                        "Total Vendido ($)": day_rev,
+                        "Efectivo ($)": day_cash,
+                        "Fiado ($)": day_credit,
+                        "N° Transacciones": day_count,
+                        "Ticket Promedio ($)": round(day_avg, 2)
+                    }]).to_excel(writer, sheet_name='Resumen_Diario', index=False)
+
+                    # Hoja 2: Productos Vendidos Hoy
+                    if items_sold:
+                        df_day_products = pd.DataFrame(list(items_sold.values()))
+                        df_day_products.sort_values('Cantidad', ascending=False).to_excel(
+                            writer, sheet_name='Productos_Vendidos_Hoy', index=False
+                        )
+
+                    # Hoja 3: Resumen Mensual
+                    pd.DataFrame([{
+                        "Mes": _mes_actual,
+                        "Ingresos Totales ($)": month_revenue,
+                        "Costo Acumulado ($)": month_cogs,
+                        "Beneficio Bruto ($)": month_profit,
+                        "Margen de Beneficio (%)": round(month_margin, 2),
+                        "N° Ventas": month_num_sales
+                    }]).to_excel(writer, sheet_name='Resumen_Mensual', index=False)
+
+                    # Hoja 4: Productos Vendidos del Mes
+                    if month_items:
+                        df_all_month = pd.DataFrame(list(month_items.values()))
+                        df_all_month.sort_values('Unidades', ascending=False).to_excel(
+                            writer, sheet_name='Productos_Vendidos_Mes', index=False
+                        )
+
+                output_full.seek(0)
+
+                st.download_button(
+                    label="⬇️ Descargar Reporte Completo Día + Mes (Excel)",
+                    data=output_full,
+                    file_name=f"Reporte_Completo_{today_utc.strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     type="primary",
                     use_container_width=True
