@@ -1207,6 +1207,36 @@ elif st.session_state.page == "📈 Reporte Diario":
             and start_of_month <= o.get('completed_at') < end_of_day
         ]
 
+        # --- Pre-calcular datos del día ANTES de los tabs (accesibles en ambos tabs) ---
+        total_revenue = sum(o.get('price', 0) for o in completed_orders_today)
+        total_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
+        total_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
+        num_transactions = len(completed_orders_today)
+        avg_ticket = total_revenue / num_transactions if num_transactions > 0 else 0
+
+        # Consolidar productos vendidos hoy
+        items_sold = {}
+        for _order in completed_orders_today:
+            for _item in _order.get('ingredients', []):
+                _name = _item.get('name', 'N/A')
+                _qty = _item.get('quantity', 0)
+                _sp = _item.get('sale_price', 0.0)
+                if _name in items_sold:
+                    items_sold[_name]['Cantidad'] += _qty
+                    items_sold[_name]['Subtotal'] += (_qty * _sp)
+                else:
+                    items_sold[_name] = {
+                        'Producto': _name,
+                        'Cantidad': _qty,
+                        'Precio Unit.': _sp,
+                        'Subtotal': (_qty * _sp)
+                    }
+
+        df_items_day = None
+        if items_sold:
+            df_items_day = pd.DataFrame(list(items_sold.values()))
+            df_items_day = df_items_day.sort_values(by='Cantidad', ascending=False)
+
         # ============================================================
         #  TABS: Reporte del Día  |  Análisis Mensual
         # ============================================================
@@ -1220,12 +1250,6 @@ elif st.session_state.page == "📈 Reporte Diario":
                 st.warning(f"No hay ventas registradas para hoy ({today_utc.strftime('%d/%m/%Y')}).")
             else:
                 # --- 1. KPIs Diarios (5 columnas) ---
-                total_revenue = sum(o.get('price', 0) for o in completed_orders_today)
-                total_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
-                total_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
-                num_transactions = len(completed_orders_today)
-                avg_ticket = total_revenue / num_transactions if num_transactions > 0 else 0
-
                 k1, k2, k3, k4, k5 = st.columns(5)
                 k1.metric("💰 Total Vendido", f"${total_revenue:,.2f}")
                 k2.metric("💵 Efectivo", f"${total_cash:,.2f}")
@@ -1238,28 +1262,7 @@ elif st.session_state.page == "📈 Reporte Diario":
                 # --- 2. Productos Vendidos Hoy (tabla consolidada) ---
                 st.subheader("📦 Productos Vendidos Hoy")
 
-                items_sold = {}
-                for order in completed_orders_today:
-                    for item in order.get('ingredients', []):
-                        name = item.get('name', 'N/A')
-                        qty = item.get('quantity', 0)
-                        sale_price = item.get('sale_price', 0.0)
-
-                        if name in items_sold:
-                            items_sold[name]['Cantidad'] += qty
-                            items_sold[name]['Subtotal'] += (qty * sale_price)
-                        else:
-                            items_sold[name] = {
-                                'Producto': name,
-                                'Cantidad': qty,
-                                'Precio Unit.': sale_price,
-                                'Subtotal': (qty * sale_price)
-                            }
-
-                if items_sold:
-                    df_items_day = pd.DataFrame(list(items_sold.values()))
-                    df_items_day = df_items_day.sort_values(by='Cantidad', ascending=False)
-
+                if df_items_day is not None:
                     st.dataframe(
                         df_items_day,
                         use_container_width=True,
@@ -1269,6 +1272,8 @@ elif st.session_state.page == "📈 Reporte Diario":
                             "Subtotal": st.column_config.NumberColumn(format="$%.2f")
                         }
                     )
+                else:
+                    st.info("No hay productos registrados en las ventas de hoy.")
 
                 st.markdown("---")
 
@@ -1316,7 +1321,6 @@ elif st.session_state.page == "📈 Reporte Diario":
                     order_method = "Fiado" if order.get('payment_method') == 'fiado' else "Efectivo"
                     order_customer = order.get('customer_name', '')
 
-                    # Obtener hora de completación
                     ca = order.get('completed_at')
                     if ca and isinstance(ca, datetime):
                         order_time = ca.astimezone(_COL_TZ).strftime("%I:%M %p").lstrip("0")
@@ -1340,19 +1344,16 @@ elif st.session_state.page == "📈 Reporte Diario":
                 st.subheader("📥 Descargar Reporte")
                 output_day = io.BytesIO()
                 with pd.ExcelWriter(output_day, engine='openpyxl') as writer:
-                    # Hoja 1: Resumen del día
-                    df_resumen = pd.DataFrame([{
+                    pd.DataFrame([{
                         "Fecha": _fecha_legible,
                         "Total Vendido ($)": total_revenue,
                         "Efectivo ($)": total_cash,
                         "Fiado ($)": total_credit,
                         "N° Transacciones": num_transactions,
                         "Ticket Promedio ($)": round(avg_ticket, 2)
-                    }])
-                    df_resumen.to_excel(writer, sheet_name='Resumen_Diario', index=False)
+                    }]).to_excel(writer, sheet_name='Resumen_Diario', index=False)
 
-                    # Hoja 2: Productos vendidos hoy
-                    if items_sold:
+                    if df_items_day is not None:
                         df_items_day.to_excel(writer, sheet_name='Productos_Vendidos_Hoy', index=False)
 
                 output_day.seek(0)
@@ -1473,9 +1474,7 @@ elif st.session_state.page == "📈 Reporte Diario":
 
                 # --- 4. Comparativa Día vs Mes ---
                 st.subheader("⚡ Comparativa: Hoy vs. Mes")
-                day_revenue = sum(o.get('price', 0) for o in completed_orders_today)
-                day_pct = (day_revenue / month_revenue * 100) if month_revenue > 0 else 0
-                day_sales_count = len(completed_orders_today)
+                day_pct = (total_revenue / month_revenue * 100) if month_revenue > 0 else 0
                 month_avg_daily = month_revenue / max(_now_col.day, 1)
 
                 cmp1, cmp2, cmp3 = st.columns(3)
@@ -1489,16 +1488,16 @@ elif st.session_state.page == "📈 Reporte Diario":
                     f"${month_avg_daily:,.2f}",
                     help="Ingreso promedio por día en el mes en curso"
                 )
-                if day_revenue > 0 and month_avg_daily > 0:
-                    diff_vs_avg = ((day_revenue - month_avg_daily) / month_avg_daily) * 100
+                if total_revenue > 0 and month_avg_daily > 0:
+                    diff_vs_avg = ((total_revenue - month_avg_daily) / month_avg_daily) * 100
                     cmp3.metric(
                         "🔄 Hoy vs. Promedio",
-                        f"${day_revenue:,.2f}",
+                        f"${total_revenue:,.2f}",
                         delta=f"{diff_vs_avg:+.1f}%",
                         help="Comparación del ingreso de hoy contra el promedio diario del mes"
                     )
                 else:
-                    cmp3.metric("🔄 Hoy vs. Promedio", f"${day_revenue:,.2f}")
+                    cmp3.metric("🔄 Hoy vs. Promedio", f"${total_revenue:,.2f}")
 
                 st.markdown("---")
 
@@ -1506,28 +1505,19 @@ elif st.session_state.page == "📈 Reporte Diario":
                 st.subheader("📥 Descargar Reporte Completo (Día + Mes)")
                 output_full = io.BytesIO()
                 with pd.ExcelWriter(output_full, engine='openpyxl') as writer:
-                    # Hoja 1: Resumen Diario
-                    day_rev = sum(o.get('price', 0) for o in completed_orders_today)
-                    day_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
-                    day_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
-                    day_count = len(completed_orders_today)
-                    day_avg = day_rev / day_count if day_count > 0 else 0
-
+                    # Hoja 1: Resumen Diario (usa variables pre-calculadas)
                     pd.DataFrame([{
                         "Fecha": _fecha_legible,
-                        "Total Vendido ($)": day_rev,
-                        "Efectivo ($)": day_cash,
-                        "Fiado ($)": day_credit,
-                        "N° Transacciones": day_count,
-                        "Ticket Promedio ($)": round(day_avg, 2)
+                        "Total Vendido ($)": total_revenue,
+                        "Efectivo ($)": total_cash,
+                        "Fiado ($)": total_credit,
+                        "N° Transacciones": num_transactions,
+                        "Ticket Promedio ($)": round(avg_ticket, 2)
                     }]).to_excel(writer, sheet_name='Resumen_Diario', index=False)
 
                     # Hoja 2: Productos Vendidos Hoy
-                    if items_sold:
-                        df_day_products = pd.DataFrame(list(items_sold.values()))
-                        df_day_products.sort_values('Cantidad', ascending=False).to_excel(
-                            writer, sheet_name='Productos_Vendidos_Hoy', index=False
-                        )
+                    if df_items_day is not None:
+                        df_items_day.to_excel(writer, sheet_name='Productos_Vendidos_Hoy', index=False)
 
                     # Hoja 3: Resumen Mensual
                     pd.DataFrame([{
