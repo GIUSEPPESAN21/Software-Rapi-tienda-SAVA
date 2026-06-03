@@ -1163,97 +1163,89 @@ elif st.session_state.page == "📊 Analítica":
                 )
 
 
-# ... existing code ...
-    elif st.session_state.page == "📈 Reporte Diario":
-        # Fecha fija solicitada (2 de junio de 2026, 19:35). 
-        # Se añade timezone.utc para mantener compatibilidad con tus fechas originales.
-        fecha_actual = datetime(2026, 6, 2, 19, 35, tzinfo=timezone.utc)
+elif st.session_state.page == "📈 Reporte Diario":
+    st.subheader("📊 Reporte Diario de Ventas")
+    st.info("Resumen exacto de las ventas de hoy y los productos vendidos.")
 
-        st.title("📊 Módulo de Reportes Avanzados")
-        st.caption(f"📅 Fecha y hora del reporte: {fecha_actual.strftime('%d de %B de %Y, %I:%M %p')}")
-        st.divider()
+    try:
+        today_utc = datetime.now(timezone.utc).date()
+        start_of_day = datetime(today_utc.year, today_utc.month, today_utc.day, tzinfo=timezone.utc)
+        end_of_day = start_of_day + timedelta(days=1)
 
-        try:
-            import pandas as pd
+        all_orders = get_cached_orders()
+        completed_orders_today = [
+            o for o in all_orders 
+            if o.get('status') == 'completed' 
+            and o.get('completed_at') 
+            and start_of_day <= o.get('completed_at') < end_of_day
+        ]
+
+        if not completed_orders_today:
+            st.warning(f"No hay ventas registradas para hoy ({today_utc.strftime('%d/%m/%Y')}).")
+        else:
+            # Calcular totales
+            total_revenue = sum(o.get('price', 0) for o in completed_orders_today)
+            total_cash = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') != 'fiado')
+            total_credit = sum(o.get('price', 0) for o in completed_orders_today if o.get('payment_method') == 'fiado')
             
-            # Usamos tu función nativa para obtener los datos
-            all_orders = get_cached_orders()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("💰 Total Vendido", f"${total_revenue:,.2f}")
+            col2.metric("💵 Recibido en Efectivo", f"${total_cash:,.2f}")
+            col3.metric("📝 Total Fiado", f"${total_credit:,.2f}")
             
-            # Filtramos solo los completados que tengan fecha
-            pedidos_completados = [
-                o for o in all_orders 
-                if o.get('status') == 'completed' and o.get('completed_at')
-            ]
-
-            if not pedidos_completados:
-                st.warning("⚠️ No hay datos de ventas registrados para generar reportes en este momento.")
-            else:
-                df_ventas = pd.DataFrame(pedidos_completados)
-                # Convertimos tu campo 'completed_at' al formato de fecha de Pandas
-                df_ventas['completed_at'] = pd.to_datetime(df_ventas['completed_at'])
-                
-                # Identificamos la columna de total (asumiendo que en tu dict se llama 'total' o 'amount')
-                col_total = 'total' if 'total' in df_ventas.columns else ('amount' if 'amount' in df_ventas.columns else None)
-
-                # ==========================================
-                # SECCIÓN 1: REPORTE DIARIO MEJORADO
-                # ==========================================
-                st.header("📈 Análisis de Ventas del Día")
-                
-                # Filtramos las ventas donde la fecha coincida con la fecha_actual
-                ventas_diarias = df_ventas[df_ventas['completed_at'].dt.date == fecha_actual.date()]
-
-                total_diario = ventas_diarias[col_total].sum() if col_total and not ventas_diarias.empty else 0.0
-                transacciones_diarias = len(ventas_diarias)
-                ticket_promedio_diario = total_diario / transacciones_diarias if transacciones_diarias > 0 else 0.0
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric(label="Ingresos de Hoy", value=f"${total_diario:,.2f}")
-                col2.metric(label="Transacciones", value=f"{transacciones_diarias}")
-                col3.metric(label="Ticket Promedio", value=f"${ticket_promedio_diario:,.2f}")
-
-                with st.expander("Ver detalle exacto de transacciones de hoy", expanded=True):
-                    if not ventas_diarias.empty:
-                        # Ocultamos la columna del estado para que la tabla sea más limpia
-                        st.dataframe(ventas_diarias.drop(columns=['status'], errors='ignore'), use_container_width=True, hide_index=True)
+            st.markdown("---")
+            st.subheader("📦 Productos Vendidos Hoy")
+            
+            # Consolidar productos vendidos
+            items_sold = {}
+            for order in completed_orders_today:
+                for item in order.get('ingredients', []):
+                    name = item.get('name', 'N/A')
+                    qty = item.get('quantity', 0)
+                    sale_price = item.get('sale_price', 0.0)
+                    
+                    if name in items_sold:
+                        items_sold[name]['Cantidad'] += qty
+                        items_sold[name]['Subtotal'] += (qty * sale_price)
                     else:
-                        st.info("No se han registrado ventas en el día de hoy.")
+                        items_sold[name] = {
+                            'Producto': name,
+                            'Cantidad': qty,
+                            'Precio Unit.': sale_price,
+                            'Subtotal': (qty * sale_price)
+                        }
+            
+            if items_sold:
+                df_items = pd.DataFrame(list(items_sold.values()))
+                df_items = df_items.sort_values(by='Cantidad', ascending=False)
+                
+                st.dataframe(
+                    df_items, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={
+                        "Precio Unit.": st.column_config.NumberColumn(format="$%.2f"),
+                        "Subtotal": st.column_config.NumberColumn(format="$%.2f")
+                    }
+                )
+                
+                # Generar Excel para descargar
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_items.to_excel(writer, sheet_name='Productos_Vendidos', index=False)
+                output.seek(0)
+                
+                st.download_button(
+                    label="⬇️ Descargar Reporte de Hoy (Excel)",
+                    data=output,
+                    file_name=f"Reporte_Diario_{today_utc.strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    use_container_width=True
+                )
 
-                st.divider()
-
-                # ==========================================
-                # SECCIÓN 2: REPORTE MENSUAL INTEGRADO
-                # ==========================================
-                st.header("📅 Análisis Mensual Acumulado")
-                st.subheader(f"Métricas correspondientes a: {fecha_actual.strftime('%B %Y').title()}")
-
-                ventas_mensuales = df_ventas[
-                    (df_ventas['completed_at'].dt.month == fecha_actual.month) &
-                    (df_ventas['completed_at'].dt.year == fecha_actual.year)
-                ]
-
-                total_mensual = ventas_mensuales[col_total].sum() if col_total and not ventas_mensuales.empty else 0.0
-                transacciones_mensuales = len(ventas_mensuales)
-                ticket_promedio_mensual = total_mensual / transacciones_mensuales if transacciones_mensuales > 0 else 0.0
-
-                m_col1, m_col2, m_col3 = st.columns(3)
-                m_col1.metric(label="Ingresos del Mes", value=f"${total_mensual:,.2f}")
-                m_col2.metric(label="Transacciones Totales", value=f"{transacciones_mensuales}")
-                m_col3.metric(label="Ticket Promedio (Mes)", value=f"${ticket_promedio_mensual:,.2f}")
-
-                if not ventas_mensuales.empty and col_total:
-                    st.markdown("**Tendencia de Ingresos Diarios (Mes en curso)**")
-                    ventas_por_dia = ventas_mensuales.groupby(ventas_mensuales['completed_at'].dt.date)[col_total].sum().reset_index()
-                    ventas_por_dia.set_index('completed_at', inplace=True)
-                    st.bar_chart(ventas_por_dia, y=col_total, use_container_width=True)
-                else:
-                    st.info("No hay suficientes datos mensuales para generar una gráfica de tendencia.")
-
-        except Exception as e:
-            st.error(f"Error interno al procesar los reportes: {str(e)}")
-
-    elif st.session_state.page == "Otro Menu": # Solo un ejemplo para mostrar dónde termina
-# ... existing code ...
+    except Exception as e:
+        st.error(f"Error al generar el reporte diario: {e}")
 
 
 elif st.session_state.page == "🏢 Acerca de SAVA":
